@@ -1,144 +1,85 @@
-import express from 'express';
-import cors from 'cors';
-import multer from 'multer';
-import crypto from 'crypto';
+ import express from "express";
+import cors from "cors";
+import multer from "multer";
+import crypto from "crypto";
+import fs from "fs";
+import path from "path";
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-/* ───────────────── CORS ───────────────── */
+/* ───────── CORS (CRITICAL) ───────── */
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "DELETE"],
+    allowedHeaders: ["Content-Type"],
+  })
+);
 
-app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type'],
-}));
+/* ───────── STORAGE ───────── */
+const ROOT = "/tmp/presence-media";
+fs.mkdirSync(ROOT, { recursive: true });
 
-app.options('*', cors());
-
-/* ───────────────── MEMORY STORE ───────────────── */
-
-/*
-  sessions = Map<
-    sessionId: string,
-    {
-      media: Map<mediaId, { buffer, mime }>
-      createdAt: number
-    }
-  >
-*/
-const sessions = new Map();
-
-/* ───────────────── MULTER (MEMORY ONLY) ───────────────── */
-
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 50 * 1024 * 1024, // 50MB
+const storage = multer.diskStorage({
+  destination(req, file, cb) {
+    const { session } = req.body;
+    if (!session) return cb(new Error("Missing session"));
+    const dir = path.join(ROOT, session);
+    fs.mkdirSync(dir, { recursive: true });
+    cb(null, dir);
+  },
+  filename(req, file, cb) {
+    const id = crypto.randomUUID();
+    cb(null, id);
   },
 });
 
-/* ───────────────── HELPERS ───────────────── */
-
-function newId() {
-  return crypto.randomBytes(16).toString('hex');
-}
-
-function log(...args) {
-  console.log('[MEDIA]', ...args);
-}
-
-/* ───────────────── ROUTES ───────────────── */
-
-/**
- * POST /media
- * body: multipart/form-data
- * fields:
- *   - sessionId (optional)
- *   - file
- */
-app.post('/media', upload.single('file'), (req, res) => {
-  try {
-    const sessionId = req.body.sessionId || newId();
-    const file = req.file;
-
-    if (!file) {
-      return res.status(400).json({ error: 'NO_FILE' });
-    }
-
-    if (!sessions.has(sessionId)) {
-      sessions.set(sessionId, {
-        media: new Map(),
-        createdAt: Date.now(),
-      });
-    }
-
-    const mediaId = newId();
-    const session = sessions.get(sessionId);
-
-    session.media.set(mediaId, {
-      buffer: file.buffer,
-      mime: file.mimetype,
-    });
-
-    log('MEDIA UPLOADED', {
-      sessionId,
-      mediaId,
-      mime: file.mimetype,
-      size: file.size,
-    });
-
-    res.json({
-      sessionId,
-      mediaId,
-      mime: file.mimetype,
-    });
-  } catch (e) {
-    log('UPLOAD ERROR', e);
-    res.status(500).json({ error: 'UPLOAD_FAILED' });
-  }
+const upload = multer({
+  storage,
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
 });
 
-/**
- * GET /media/:sessionId/:mediaId
- */
-app.get('/media/:sessionId/:mediaId', (req, res) => {
-  const { sessionId, mediaId } = req.params;
-
-  const session = sessions.get(sessionId);
-  if (!session) return res.sendStatus(404);
-
-  const media = session.media.get(mediaId);
-  if (!media) return res.sendStatus(404);
-
-  res.setHeader('Content-Type', media.mime);
-  res.setHeader('Cache-Control', 'no-store');
-  res.send(media.buffer);
-});
-
-/**
- * DELETE /session/:sessionId
- * Destroys everything for everyone
- */
-app.delete('/session/:sessionId', (req, res) => {
-  const { sessionId } = req.params;
-
-  if (sessions.has(sessionId)) {
-    sessions.delete(sessionId);
-    log('SESSION DESTROYED', sessionId);
+/* ───────── UPLOAD ───────── */
+app.post("/media", upload.single("file"), (req, res) => {
+  const { session } = req.body;
+  if (!req.file || !session) {
+    console.error("[MEDIA] upload failed");
+    return res.status(400).end();
   }
 
-  res.json({ ok: true });
+  console.log(
+    `[MEDIA] UPLOAD session=${session} id=${req.file.filename} type=${req.file.mimetype}`
+  );
+
+  res.json({
+    id: req.file.filename,
+    mime: req.file.mimetype,
+    size: req.file.size,
+  });
 });
 
-/* ───────────────── HEALTH ───────────────── */
-
-app.get('/', (_, res) => {
-  res.send('Presence Media Server OK');
+/* ───────── FETCH ───────── */
+app.get("/media/:session/:id", (req, res) => {
+  const file = path.join(ROOT, req.params.session, req.params.id);
+  if (!fs.existsSync(file)) return res.sendStatus(404);
+  console.log(`[MEDIA] FETCH ${file}`);
+  res.sendFile(file);
 });
 
-/* ───────────────── START ───────────────── */
-
-app.listen(PORT, () => {
-  log(`SERVER RUNNING ON ${PORT}`);
+/* ───────── SESSION DESTROY ───────── */
+app.delete("/media/:session", (req, res) => {
+  const dir = path.join(ROOT, req.params.session);
+  if (fs.existsSync(dir)) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    console.log(`[MEDIA] DESTROY session=${req.params.session}`);
+  }
+  res.sendStatus(204);
 });
+
+/* ───────── HEALTH ───────── */
+app.get("/", (_, res) => res.send("presence media server alive"));
+
+app.listen(PORT, () =>
+  console.log(`[MEDIA] SERVER RUNNING on ${PORT}`)
+);
