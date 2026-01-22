@@ -1,68 +1,184 @@
- import express from 'express';
+// presence-media-server
+// Node 18+ | Railway compatible | ESM
+
+import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import crypto from 'crypto';
 
+/* ───────────────── APP SETUP ───────────────── */
+
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-/* ───────────────── CORS ───────────────── */
-
+/* ───────────────── CORS (CRITICAL) ───────────────── */
+/*
+  This is what fixes:
+  "No 'Access-Control-Allow-Origin' header is present"
+*/
 app.use(
   cors({
-    origin: '*', // allow Flutter web
-    methods: ['GET', 'POST'],
+    origin: '*',
+    methods: ['GET', 'POST', 'OPTIONS'],
     allowedHeaders: ['Content-Type'],
   })
 );
 
-/* ───────────────── STORAGE ───────────────── */
+app.use(express.json());
 
-const upload = multer({ storage: multer.memoryStorage() });
-const store = new Map(); // token -> Buffer
+/* ───────────────── MEMORY STORAGE ───────────────── */
+/*
+  No disk writes.
+  Media lives only in RAM.
+  Dies when session dies or server restarts.
+*/
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 50 * 1024 * 1024, // 50 MB (adjust if needed)
+  },
+});
 
-/* ───────────────── LOG ───────────────── */
+/* ───────────────── SESSION STORE ───────────────── */
+/*
+  sessions = Map<
+    sessionId,
+    {
+      createdAt: number,
+      media: Array<{
+        id,
+        name,
+        type,
+        size,
+        buffer
+      }>
+    }
+  >
+*/
+const sessions = new Map();
+
+/* ───────────────── UTIL ───────────────── */
 
 function log(...args) {
   console.log('[MEDIA]', ...args);
 }
 
-/* ───────────────── UPLOAD ───────────────── */
+function createSessionIfMissing(sessionId) {
+  if (!sessions.has(sessionId)) {
+    sessions.set(sessionId, {
+      createdAt: Date.now(),
+      media: [],
+    });
+    log('SESSION CREATED →', sessionId);
+  }
+}
+
+/* ───────────────── HEALTH CHECK ───────────────── */
+
+app.get('/', (_, res) => {
+  res.send('Presence Media Server OK');
+});
+
+/* ───────────────── UPLOAD MEDIA ───────────────── */
+/*
+  POST /media
+  Headers:
+    x-session-id: <presence session id>
+
+  Body:
+    multipart/form-data
+    file=<binary>
+*/
 
 app.post('/media', upload.single('file'), (req, res) => {
-  log('UPLOAD');
+  const sessionId = req.headers['x-session-id'];
+
+  if (!sessionId) {
+    return res.status(400).json({ error: 'Missing x-session-id header' });
+  }
 
   if (!req.file) {
-    log('UPLOAD FAILED → no file');
-    return res.status(400).json({ error: 'No file' });
+    return res.status(400).json({ error: 'No file uploaded' });
   }
 
-  const token = crypto.randomUUID();
-  store.set(token, req.file.buffer);
+  createSessionIfMissing(sessionId);
 
-  log('STORED → token=', token, 'bytes=', req.file.buffer.length);
+  const mediaId = crypto.randomUUID();
 
-  res.json({ token });
+  const media = {
+    id: mediaId,
+    name: req.file.originalname,
+    type: req.file.mimetype,
+    size: req.file.size,
+    buffer: req.file.buffer,
+  };
+
+  sessions.get(sessionId).media.push(media);
+
+  log('MEDIA RX', {
+    sessionId,
+    id: mediaId,
+    name: media.name,
+    type: media.type,
+    size: media.size,
+  });
+
+  // Respond immediately — no blocking
+  res.json({
+    ok: true,
+    id: mediaId,
+    name: media.name,
+    type: media.type,
+    size: media.size,
+  });
 });
 
-/* ───────────────── FETCH ───────────────── */
+/* ───────────────── FETCH MEDIA ───────────────── */
+/*
+  GET /media/:sessionId/:mediaId
+*/
 
-app.get('/media/:token', (req, res) => {
-  const { token } = req.params;
-  log('FETCH →', token);
+app.get('/media/:sessionId/:mediaId', (req, res) => {
+  const { sessionId, mediaId } = req.params;
 
-  const data = store.get(token);
-  if (!data) {
-    log('MISS →', token);
-    return res.sendStatus(404);
+  const session = sessions.get(sessionId);
+  if (!session) {
+    return res.status(404).send('Session not found');
   }
 
-  res.setHeader('Content-Type', 'application/octet-stream');
-  res.send(data);
+  const media = session.media.find((m) => m.id === mediaId);
+  if (!media) {
+    return res.status(404).send('Media not found');
+  }
+
+  res.setHeader('Content-Type', media.type);
+  res.setHeader('Content-Length', media.size);
+  res.send(media.buffer);
 });
 
-/* ───────────────── START ───────────────── */
+/* ───────────────── END SESSION (HARD DELETE) ───────────────── */
+/*
+  Called when Presence session collapses.
+  Destroys all media instantly.
+*/
+
+app.post('/session/end', (req, res) => {
+  const { sessionId } = req.body;
+
+  if (!sessionId) {
+    return res.status(400).json({ error: 'Missing sessionId' });
+  }
+
+  if (sessions.has(sessionId)) {
+    sessions.delete(sessionId);
+    log('SESSION DESTROYED →', sessionId);
+  }
+
+  res.json({ ok: true });
+});
+
+/* ───────────────── START SERVER ───────────────── */
 
 app.listen(PORT, () => {
-  log(`RUNNING on :${PORT}`);
+  log(`SERVER RUNNING ON :${PORT}`);
 });
