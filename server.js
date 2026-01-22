@@ -1,89 +1,144 @@
-const express = require('express');
-const multer = require('multer');
-const crypto = require('crypto');
+import express from 'express';
+import cors from 'cors';
+import multer from 'multer';
+import crypto from 'crypto';
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-/* ───────── CORS (ABSOLUTE) ───────── */
+/* ───────────────── CORS ───────────────── */
 
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader(
-    'Access-Control-Allow-Headers',
-    'Origin, X-Requested-With, Content-Type, Accept, x-session-id'
-  );
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type'],
+}));
 
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-  next();
-});
+app.options('*', cors());
 
-app.use(express.json());
+/* ───────────────── MEMORY STORE ───────────────── */
 
-/* ───────── UPLOAD ───────── */
-
-const upload = multer({ storage: multer.memoryStorage() });
-
+/*
+  sessions = Map<
+    sessionId: string,
+    {
+      media: Map<mediaId, { buffer, mime }>
+      createdAt: number
+    }
+  >
+*/
 const sessions = new Map();
 
-function ensureSession(id) {
-  if (!sessions.has(id)) {
-    sessions.set(id, { media: new Map() });
-    console.log('[MEDIA] SESSION CREATED', id);
-  }
+/* ───────────────── MULTER (MEMORY ONLY) ───────────────── */
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 50 * 1024 * 1024, // 50MB
+  },
+});
+
+/* ───────────────── HELPERS ───────────────── */
+
+function newId() {
+  return crypto.randomBytes(16).toString('hex');
 }
 
-/* ───────── ROUTES ───────── */
+function log(...args) {
+  console.log('[MEDIA]', ...args);
+}
 
-app.get('/', (_, res) => res.send('Presence Media Server OK'));
+/* ───────────────── ROUTES ───────────────── */
 
+/**
+ * POST /media
+ * body: multipart/form-data
+ * fields:
+ *   - sessionId (optional)
+ *   - file
+ */
 app.post('/media', upload.single('file'), (req, res) => {
-  const sessionId = req.headers['x-session-id'];
-  if (!sessionId || !req.file) {
-    return res.status(400).json({ error: 'bad request' });
+  try {
+    const sessionId = req.body.sessionId || newId();
+    const file = req.file;
+
+    if (!file) {
+      return res.status(400).json({ error: 'NO_FILE' });
+    }
+
+    if (!sessions.has(sessionId)) {
+      sessions.set(sessionId, {
+        media: new Map(),
+        createdAt: Date.now(),
+      });
+    }
+
+    const mediaId = newId();
+    const session = sessions.get(sessionId);
+
+    session.media.set(mediaId, {
+      buffer: file.buffer,
+      mime: file.mimetype,
+    });
+
+    log('MEDIA UPLOADED', {
+      sessionId,
+      mediaId,
+      mime: file.mimetype,
+      size: file.size,
+    });
+
+    res.json({
+      sessionId,
+      mediaId,
+      mime: file.mimetype,
+    });
+  } catch (e) {
+    log('UPLOAD ERROR', e);
+    res.status(500).json({ error: 'UPLOAD_FAILED' });
   }
-
-  ensureSession(sessionId);
-
-  const id = crypto.randomUUID();
-  sessions.get(sessionId).media.set(id, req.file);
-
-  console.log('[MEDIA] RX', sessionId, id, req.file.originalname);
-
-  res.json({
-    ok: true,
-    id,
-    name: req.file.originalname,
-    type: req.file.mimetype,
-    size: req.file.size,
-  });
 });
 
-app.get('/media/:session/:id', (req, res) => {
-  const session = sessions.get(req.params.session);
+/**
+ * GET /media/:sessionId/:mediaId
+ */
+app.get('/media/:sessionId/:mediaId', (req, res) => {
+  const { sessionId, mediaId } = req.params;
+
+  const session = sessions.get(sessionId);
   if (!session) return res.sendStatus(404);
 
-  const file = session.media.get(req.params.id);
-  if (!file) return res.sendStatus(404);
+  const media = session.media.get(mediaId);
+  if (!media) return res.sendStatus(404);
 
-  res.setHeader('Content-Type', file.mimetype);
-  res.send(file.buffer);
+  res.setHeader('Content-Type', media.mime);
+  res.setHeader('Cache-Control', 'no-store');
+  res.send(media.buffer);
 });
 
-app.post('/session/end', (req, res) => {
-  const { sessionId } = req.body || {};
-  if (sessionId) {
+/**
+ * DELETE /session/:sessionId
+ * Destroys everything for everyone
+ */
+app.delete('/session/:sessionId', (req, res) => {
+  const { sessionId } = req.params;
+
+  if (sessions.has(sessionId)) {
     sessions.delete(sessionId);
-    console.log('[MEDIA] SESSION DESTROYED', sessionId);
+    log('SESSION DESTROYED', sessionId);
   }
+
   res.json({ ok: true });
 });
 
-/* ───────── START ───────── */
+/* ───────────────── HEALTH ───────────────── */
+
+app.get('/', (_, res) => {
+  res.send('Presence Media Server OK');
+});
+
+/* ───────────────── START ───────────────── */
 
 app.listen(PORT, () => {
-  console.log('[MEDIA] SERVER RUNNING ON', PORT);
+  log(`SERVER RUNNING ON ${PORT}`);
 });
