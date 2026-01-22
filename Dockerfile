@@ -1,17 +1,17 @@
-FROM node:18-alpine
+ FROM node:18-alpine
 
 WORKDIR /app
 
-# Copy package files FIRST (critical for caching)
-COPY package.json package-lock.json ./
+# Copy package.json ONLY
+COPY package.json ./
 
 # Install dependencies
-RUN npm ci --omit=dev
+RUN npm install --omit=dev
 
-# Copy application code
+# Copy server code
 COPY server.js ./
 
-# Create temp directory
+# Create tmp dir (optional safety)
 RUN mkdir -p tmp
 
 EXPOSE 8080
