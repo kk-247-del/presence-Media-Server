@@ -1,5 +1,5 @@
- // presence-media-server
-// Node.js 18+ | Railway | ESM
+// presence-media-server
+// Node.js 18+ | Railway | ESM | Flutter Web compatible
 
 import express from 'express';
 import multer from 'multer';
@@ -10,10 +10,13 @@ import crypto from 'crypto';
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-/* ───────────────── HARD CORS FIX (MANDATORY) ───────────────── */
+/* ───────────────── ABSOLUTE CORS LAYER ───────────────── */
 /*
-  This explicitly handles preflight (OPTIONS),
-  which Flutter Web + file_picker_web REQUIRE.
+  This layer:
+  - Runs FIRST
+  - Handles OPTIONS
+  - Injects headers on ALL responses
+  - Fixes Flutter Web + file_picker_web permanently
 */
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -26,9 +29,9 @@ app.use((req, res, next) => {
     'GET, POST, OPTIONS'
   );
 
-  // Handle preflight immediately
+  // 🚨 CRITICAL: preflight must end HERE
   if (req.method === 'OPTIONS') {
-    return res.sendStatus(200);
+    return res.status(200).end();
   }
 
   next();
@@ -38,11 +41,11 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 
-/* ───────────────── UPLOAD (MEMORY ONLY) ───────────────── */
+/* ───────────────── MEMORY UPLOAD ───────────────── */
 /*
-  No disk.
-  No persistence.
-  Media lives only for the session.
+  - No disk
+  - No persistence
+  - Session-bound only
 */
 
 const upload = multer({
@@ -74,11 +77,13 @@ const upload = multer({
 
 const sessions = new Map();
 
-/* ───────────────── UTIL ───────────────── */
+/* ───────────────── LOG ───────────────── */
 
 function log(...args) {
   console.log('[MEDIA]', ...args);
 }
+
+/* ───────────────── SESSION UTIL ───────────────── */
 
 function ensureSession(sessionId) {
   if (!sessions.has(sessionId)) {
@@ -89,6 +94,17 @@ function ensureSession(sessionId) {
     log('SESSION CREATED →', sessionId);
   }
 }
+
+/* ───────────────── DIAGNOSTIC ENDPOINT ───────────────── */
+/*
+  Use this to VERIFY CORS in browser
+*/
+app.get('/__cors_test', (req, res) => {
+  res.json({
+    ok: true,
+    headers: res.getHeaders(),
+  });
+});
 
 /* ───────────────── HEALTH ───────────────── */
 
@@ -101,53 +117,53 @@ app.get('/', (_, res) => {
   POST /media
   Headers:
     x-session-id: <presence address>
-
-  Body:
-    multipart/form-data
-    file=<binary>
 */
 
 app.post('/media', upload.single('file'), (req, res) => {
-  const sessionId = req.headers['x-session-id'];
+  try {
+    const sessionId = req.headers['x-session-id'];
 
-  if (!sessionId) {
-    return res.status(400).json({ error: 'Missing x-session-id header' });
+    if (!sessionId) {
+      return res.status(400).json({ error: 'Missing x-session-id header' });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    ensureSession(sessionId);
+
+    const mediaId = crypto.randomUUID();
+
+    const media = {
+      id: mediaId,
+      name: req.file.originalname,
+      type: req.file.mimetype,
+      size: req.file.size,
+      buffer: req.file.buffer,
+    };
+
+    sessions.get(sessionId).media.set(mediaId, media);
+
+    log('MEDIA RX', {
+      sessionId,
+      id: mediaId,
+      name: media.name,
+      type: media.type,
+      size: media.size,
+    });
+
+    res.json({
+      ok: true,
+      id: mediaId,
+      name: media.name,
+      type: media.type,
+      size: media.size,
+    });
+  } catch (e) {
+    log('UPLOAD ERROR', e);
+    res.status(500).json({ error: 'upload_failed' });
   }
-
-  if (!req.file) {
-    return res.status(400).json({ error: 'No file uploaded' });
-  }
-
-  ensureSession(sessionId);
-
-  const mediaId = crypto.randomUUID();
-
-  const media = {
-    id: mediaId,
-    name: req.file.originalname,
-    type: req.file.mimetype,
-    size: req.file.size,
-    buffer: req.file.buffer,
-  };
-
-  sessions.get(sessionId).media.set(mediaId, media);
-
-  log('MEDIA RX', {
-    sessionId,
-    id: mediaId,
-    name: media.name,
-    type: media.type,
-    size: media.size,
-  });
-
-  // Immediate response — no blocking
-  res.json({
-    ok: true,
-    id: mediaId,
-    name: media.name,
-    type: media.type,
-    size: media.size,
-  });
 });
 
 /* ───────────────── FETCH MEDIA ───────────────── */
@@ -175,8 +191,7 @@ app.get('/media/:sessionId/:mediaId', (req, res) => {
 
 /* ───────────────── END SESSION (HARD WIPE) ───────────────── */
 /*
-  Called when Presence session collapses.
-  Destroys all media instantly.
+  Call when Presence collapses
 */
 
 app.post('/session/end', (req, res) => {
