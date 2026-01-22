@@ -1,0 +1,12 @@
+{
+  "name": "hi-presence-signal",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}
