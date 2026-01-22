@@ -1,4 +1,4 @@
- import express from "express";
+import express from "express";
 import cors from "cors";
 import multer from "multer";
 import crypto from "crypto";
@@ -8,14 +8,8 @@ import path from "path";
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-/* ───────── CORS (CRITICAL) ───────── */
-app.use(
-  cors({
-    origin: "*",
-    methods: ["GET", "POST", "DELETE"],
-    allowedHeaders: ["Content-Type"],
-  })
-);
+/* ───────── CORS ───────── */
+app.use(cors({ origin: "*", methods: ["GET", "POST", "DELETE"] }));
 
 /* ───────── STORAGE ───────── */
 const ROOT = "/tmp/presence-media";
@@ -23,34 +17,22 @@ fs.mkdirSync(ROOT, { recursive: true });
 
 const storage = multer.diskStorage({
   destination(req, file, cb) {
-    const { session } = req.body;
+    const session = req.body.session;
     if (!session) return cb(new Error("Missing session"));
     const dir = path.join(ROOT, session);
     fs.mkdirSync(dir, { recursive: true });
     cb(null, dir);
   },
-  filename(req, file, cb) {
-    const id = crypto.randomUUID();
-    cb(null, id);
+  filename(_, __, cb) {
+    cb(null, crypto.randomUUID());
   },
 });
 
-const upload = multer({
-  storage,
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
-});
+const upload = multer({ storage });
 
 /* ───────── UPLOAD ───────── */
 app.post("/media", upload.single("file"), (req, res) => {
-  const { session } = req.body;
-  if (!req.file || !session) {
-    console.error("[MEDIA] upload failed");
-    return res.status(400).end();
-  }
-
-  console.log(
-    `[MEDIA] UPLOAD session=${session} id=${req.file.filename} type=${req.file.mimetype}`
-  );
+  if (!req.file || !req.body.session) return res.sendStatus(400);
 
   res.json({
     id: req.file.filename,
@@ -63,21 +45,16 @@ app.post("/media", upload.single("file"), (req, res) => {
 app.get("/media/:session/:id", (req, res) => {
   const file = path.join(ROOT, req.params.session, req.params.id);
   if (!fs.existsSync(file)) return res.sendStatus(404);
-  console.log(`[MEDIA] FETCH ${file}`);
   res.sendFile(file);
 });
 
-/* ───────── SESSION DESTROY ───────── */
+/* ───────── CLEANUP ───────── */
 app.delete("/media/:session", (req, res) => {
   const dir = path.join(ROOT, req.params.session);
-  if (fs.existsSync(dir)) {
-    fs.rmSync(dir, { recursive: true, force: true });
-    console.log(`[MEDIA] DESTROY session=${req.params.session}`);
-  }
+  fs.rmSync(dir, { recursive: true, force: true });
   res.sendStatus(204);
 });
 
-/* ───────── HEALTH ───────── */
 app.get("/", (_, res) => res.send("presence media server alive"));
 
 app.listen(PORT, () =>
