@@ -1,74 +1,68 @@
-import express from 'express';
+ import express from 'express';
+import cors from 'cors';
 import multer from 'multer';
 import crypto from 'crypto';
-import fs from 'fs';
-import path from 'path';
 
 const app = express();
-const upload = multer({ dest: 'tmp/' });
-
 const PORT = process.env.PORT || 8080;
 
-/*
-  mediaStore = Map<
-    token,
-    { filePath, expires }
-  >
-*/
-const mediaStore = new Map();
+/* ───────────────── CORS ───────────────── */
 
-function log(...a) {
-  console.log('[HI_PRESENCE][MEDIA]', ...a);
+app.use(
+  cors({
+    origin: '*', // allow Flutter web
+    methods: ['GET', 'POST'],
+    allowedHeaders: ['Content-Type'],
+  })
+);
+
+/* ───────────────── STORAGE ───────────────── */
+
+const upload = multer({ storage: multer.memoryStorage() });
+const store = new Map(); // token -> Buffer
+
+/* ───────────────── LOG ───────────────── */
+
+function log(...args) {
+  console.log('[MEDIA]', ...args);
 }
 
-/* ───────── UPLOAD ───────── */
+/* ───────────────── UPLOAD ───────────────── */
+
 app.post('/media', upload.single('file'), (req, res) => {
+  log('UPLOAD');
+
   if (!req.file) {
-    return res.status(400).json({ error: 'NO_FILE' });
+    log('UPLOAD FAILED → no file');
+    return res.status(400).json({ error: 'No file' });
   }
 
-  const token = crypto.randomBytes(16).toString('hex');
-  const expires = Date.now() + 5 * 60 * 1000;
+  const token = crypto.randomUUID();
+  store.set(token, req.file.buffer);
 
-  mediaStore.set(token, {
-    filePath: req.file.path,
-    expires,
-  });
+  log('STORED → token=', token, 'bytes=', req.file.buffer.length);
 
-  log(`UPLOAD ${token}`);
   res.json({ token });
 });
 
-/* ───────── ONE-TIME FETCH ───────── */
+/* ───────────────── FETCH ───────────────── */
+
 app.get('/media/:token', (req, res) => {
-  const entry = mediaStore.get(req.params.token);
-  if (!entry) {
-    return res.sendStatus(410);
+  const { token } = req.params;
+  log('FETCH →', token);
+
+  const data = store.get(token);
+  if (!data) {
+    log('MISS →', token);
+    return res.sendStatus(404);
   }
 
-  mediaStore.delete(req.params.token);
-
-  res.sendFile(
-    path.resolve(entry.filePath),
-    {},
-    () => fs.unlink(entry.filePath, () => {})
-  );
-
-  log(`FETCH ${req.params.token}`);
+  res.setHeader('Content-Type', 'application/octet-stream');
+  res.send(data);
 });
 
-/* ───────── TTL SWEEP ───────── */
-setInterval(() => {
-  const now = Date.now();
-  for (const [token, entry] of mediaStore) {
-    if (entry.expires < now) {
-      fs.unlink(entry.filePath, () => {});
-      mediaStore.delete(token);
-      log(`EXPIRE ${token}`);
-    }
-  }
-}, 60_000);
+/* ───────────────── START ───────────────── */
 
 app.listen(PORT, () => {
-  log(`MEDIA SERVER RUNNING :${PORT}`);
+  log(`RUNNING on :${PORT}`);
 });
