@@ -2,12 +2,17 @@ FROM node:18-alpine
 
 WORKDIR /app
 
-COPY package.json ./
-RUN npm install --omit=dev
+# Copy package files FIRST (critical for caching)
+COPY package.json package-lock.json ./
 
+# Install dependencies
+RUN npm ci --omit=dev
+
+# Copy application code
 COPY server.js ./
 
-RUN mkdir tmp
+# Create temp directory
+RUN mkdir -p tmp
 
 EXPOSE 8080
 
