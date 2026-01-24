@@ -1,99 +1,56 @@
-import http from 'http';
-import { WebSocketServer } from 'ws';
-import crypto from 'crypto';
+/**
+ * Locus Presence Signaling Server
+ * Railway-compatible
+ */
+
+import http from "http";
+import WebSocket, { WebSocketServer } from "ws";
+import crypto from "crypto";
 
 /* ───────────────── CONFIG ───────────────── */
 
-const PORT = process.env.PORT || 10000;
-const KNOCK_TTL_MS = 72 * 60 * 60 * 1000; // 72 hours
-const REQUEST_TTL_MS = 60 * 60 * 1000;   // 1 hour
+const PORT = process.env.PORT || 8080;
+const HEARTBEAT_INTERVAL = 20000;
 
 /* ───────────────── STATE ───────────────── */
 
-const knockRegistry = new Map();
-const knockRequests = new Map();
+const sessions = new Map(); // sessionId -> { a, b }
+const knocks = new Map();   // knockName -> ws
+
+/* ───────────────── HELPERS ───────────────── */
+
+function uid() {
+  return crypto.randomUUID();
+}
+
+function safeSend(ws, obj) {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(obj));
+  }
+}
 
 /* ───────────────── HTTP SERVER ───────────────── */
 
-const server = http.createServer((req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
-
-  if (req.method === 'POST' && req.url === '/knock/send') {
-    let body = '';
-    req.on('data', c => (body += c));
-    req.on('end', () => {
-      let payload;
-      try {
-        payload = JSON.parse(body);
-      } catch {
-        res.writeHead(400);
-        res.end('bad_json');
-        return;
-      }
-
-      const { from, to, time } = payload;
-      if (!from || !to || !time) {
-        res.writeHead(400);
-        res.end('invalid_payload');
-        return;
-      }
-
-      const recipient = knockRegistry.get(to);
-      if (!recipient || recipient.socket.readyState !== 1) {
-        res.writeHead(404);
-        res.end('recipient_not_available');
-        return;
-      }
-
-      const id = crypto.randomUUID();
-      knockRequests.set(id, {
-        id,
-        from,
-        to,
-        time,
-        expiresAt: Date.now() + REQUEST_TTL_MS,
-      });
-
-      try {
-        recipient.socket.send(
-          JSON.stringify({
-            type: 'knock_request',
-            payload: { id, from, to, time },
-          }),
-        );
-      } catch {
-        knockRequests.delete(id);
-        res.writeHead(500);
-        res.end('delivery_failed');
-        return;
-      }
-
-      res.writeHead(200);
-      res.end('ok');
-    });
-    return;
-  }
-
+const server = http.createServer((_, res) => {
   res.writeHead(200);
-  res.end('OK');
+  res.end("Presence signaling server alive");
 });
 
 /* ───────────────── WEBSOCKET ───────────────── */
 
-const wss = new WebSocketServer({ server, path: '/ws' });
+const wss = new WebSocketServer({ server });
 
-wss.on('connection', ws => {
-  let registeredKnock = null;
+wss.on("connection", (ws) => {
+  ws.id = uid();
+  ws.sessionId = null;
+  ws.knockName = null;
+  ws.isAlive = true;
 
-  ws.on('message', raw => {
+  ws.on("pong", () => {
+    ws.isAlive = true;
+  });
+
+  ws.on("message", (raw) => {
     let msg;
     try {
       msg = JSON.parse(raw.toString());
@@ -101,110 +58,113 @@ wss.on('connection', ws => {
       return;
     }
 
-    /* ─── REGISTER KNOCK ─── */
-    if (msg.type === 'register_knock') {
-      if (!msg.name) return;
+    switch (msg.type) {
+      /* ───── PRESENCE ───── */
 
-      registeredKnock = msg.name;
-      knockRegistry.set(msg.name, {
-        socket: ws,
-        expiresAt: Date.now() + KNOCK_TTL_MS,
-      });
-      return;
-    }
+      case "join": {
+        const sessionId = msg.address || msg.linkToken;
+        if (!sessionId) return;
 
-    /* ─── JOIN (USED BY MomentEngine) ─── */
-    if (msg.type === 'join') {
-      const address = msg.address || msg.linkToken;
-      if (!address) return;
+        ws.sessionId = sessionId;
 
-      // CRITICAL: set address FIRST
-      ws.__joinedAddress = address;
-
-      knockRegistry.set(address, {
-        socket: ws,
-        expiresAt: Date.now() + KNOCK_TTL_MS,
-      });
-
-      // now search for peer
-      for (const entry of knockRegistry.values()) {
-        if (
-          entry.socket !== ws &&
-          entry.socket.readyState === 1 &&
-          entry.socket.__joinedAddress === address
-        ) {
-          try {
-            ws.send(JSON.stringify({ type: 'ready' }));
-            entry.socket.send(JSON.stringify({ type: 'ready' }));
-          } catch {}
+        let s = sessions.get(sessionId);
+        if (!s) {
+          s = { a: ws, b: null };
+          sessions.set(sessionId, s);
           return;
         }
+
+        if (!s.b) {
+          s.b = ws;
+
+          safeSend(s.a, { type: "ready" });
+          safeSend(s.b, { type: "ready" });
+        }
+        break;
       }
 
-      return;
-    }
+      case "ping":
+        safeSend(ws, { type: "pong" });
+        break;
 
-    /* ─── RESPONSE ─── */
-    if (msg.type === 'knock_response') {
-      const req = knockRequests.get(msg.id);
-      if (!req) return;
+      /* ───── RELAY ───── */
 
-      const sender = knockRegistry.get(req.from);
-      if (sender && sender.socket.readyState === 1) {
-        try {
-          sender.socket.send(
-            JSON.stringify({
-              type: 'knock_response',
-              payload: {
-                id: msg.id,
-                action: msg.action,
-                time: msg.time,
-              },
-            }),
-          );
-        } catch {}
+      case "text":
+      case "hold":
+      case "clear":
+      case "reveal_frame": {
+        const peer = getPeer(ws);
+        if (peer) safeSend(peer, msg);
+        break;
       }
 
-      knockRequests.delete(msg.id);
-      return;
-    }
+      /* ───── COLLAPSE ───── */
 
-    /* ─── HEARTBEAT ─── */
-    if (msg.type === 'ping') {
-      if (ws.__joinedAddress && knockRegistry.has(ws.__joinedAddress)) {
-        knockRegistry.get(ws.__joinedAddress).expiresAt =
-          Date.now() + KNOCK_TTL_MS;
+      case "collapse": {
+        const peer = getPeer(ws);
+        if (peer) safeSend(peer, { type: "collapse", reason: msg.reason });
+        cleanup(ws);
+        break;
+      }
+
+      /* ───── KNOCK SYSTEM ───── */
+
+      case "register_knock":
+        ws.knockName = msg.name;
+        knocks.set(msg.name, ws);
+        break;
+
+      case "knock_response": {
+        const target = knocks.get(msg.id);
+        if (target) safeSend(target, msg);
+        break;
       }
     }
   });
 
-  ws.on('close', () => {
-    if (registeredKnock) knockRegistry.delete(registeredKnock);
-    if (ws.__joinedAddress) knockRegistry.delete(ws.__joinedAddress);
+  ws.on("close", () => {
+    const peer = getPeer(ws);
+    if (peer) safeSend(peer, { type: "collapse", reason: "peer_lost" });
+    cleanup(ws);
   });
 });
 
-/* ───────────────── CLEANUP ───────────────── */
+/* ───────────────── UTIL ───────────────── */
 
-setInterval(() => {
-  const now = Date.now();
+function getPeer(ws) {
+  if (!ws.sessionId) return null;
+  const s = sessions.get(ws.sessionId);
+  if (!s) return null;
+  return s.a === ws ? s.b : s.a;
+}
 
-  for (const [key, entry] of knockRegistry) {
-    if (entry.expiresAt < now || entry.socket.readyState !== 1) {
-      try {
-        entry.socket.close();
-      } catch {}
-      knockRegistry.delete(key);
+function cleanup(ws) {
+  if (ws.sessionId) {
+    const s = sessions.get(ws.sessionId);
+    if (s) {
+      if (s.a === ws) s.a = null;
+      if (s.b === ws) s.b = null;
+      if (!s.a && !s.b) sessions.delete(ws.sessionId);
     }
   }
 
-  for (const [id, req] of knockRequests) {
-    if (req.expiresAt < now) knockRequests.delete(id);
+  if (ws.knockName) {
+    knocks.delete(ws.knockName);
   }
-}, 30_000);
+}
+
+/* ───────────────── HEARTBEAT ───────────────── */
+
+setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (!ws.isAlive) return ws.terminate();
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, HEARTBEAT_INTERVAL);
 
 /* ───────────────── START ───────────────── */
 
 server.listen(PORT, () => {
-  console.log(`[SERVER] Running on port ${PORT}`);
+  console.log(`Presence server running on ${PORT}`);
 });
