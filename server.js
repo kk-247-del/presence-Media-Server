@@ -1,8 +1,3 @@
-/**
- * Locus Presence Signaling Server
- * Railway-compatible
- */
-
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
 import crypto from "crypto";
@@ -19,8 +14,10 @@ const knocks = new Map();   // knockName -> ws
 
 /* ───────────────── HELPERS ───────────────── */
 
-function uid() {
-  return crypto.randomUUID();
+const uid = () => crypto.randomUUID();
+
+function log(...args) {
+  console.log(new Date().toISOString(), ...args);
 }
 
 function safeSend(ws, obj) {
@@ -29,11 +26,11 @@ function safeSend(ws, obj) {
   }
 }
 
-/* ───────────────── HTTP SERVER ───────────────── */
+/* ───────────────── HTTP ───────────────── */
 
 const server = http.createServer((_, res) => {
   res.writeHead(200);
-  res.end("Presence signaling server alive");
+  res.end("Presence server alive");
 });
 
 /* ───────────────── WEBSOCKET ───────────────── */
@@ -46,8 +43,11 @@ wss.on("connection", (ws) => {
   ws.knockName = null;
   ws.isAlive = true;
 
+  log('[WS CONNECT]', ws.id);
+
   ws.on("pong", () => {
     ws.isAlive = true;
+    log('[PONG]', ws.id);
   });
 
   ws.on("message", (raw) => {
@@ -55,12 +55,13 @@ wss.on("connection", (ws) => {
     try {
       msg = JSON.parse(raw.toString());
     } catch {
+      log('[BAD JSON]', ws.id);
       return;
     }
 
-    switch (msg.type) {
-      /* ───── PRESENCE ───── */
+    log('[MSG]', ws.id, msg.type);
 
+    switch (msg.type) {
       case "join": {
         const sessionId = msg.address || msg.linkToken;
         if (!sessionId) return;
@@ -71,12 +72,13 @@ wss.on("connection", (ws) => {
         if (!s) {
           s = { a: ws, b: null };
           sessions.set(sessionId, s);
+          log('[SESSION CREATED]', sessionId);
           return;
         }
 
         if (!s.b) {
           s.b = ws;
-
+          log('[SESSION READY]', sessionId);
           safeSend(s.a, { type: "ready" });
           safeSend(s.b, { type: "ready" });
         }
@@ -84,45 +86,49 @@ wss.on("connection", (ws) => {
       }
 
       case "ping":
+        log('[PING]', ws.id);
         safeSend(ws, { type: "pong" });
         break;
-
-      /* ───── RELAY ───── */
 
       case "text":
       case "hold":
       case "clear":
       case "reveal_frame": {
         const peer = getPeer(ws);
-        if (peer) safeSend(peer, msg);
+        if (peer) {
+          log('[RELAY]', msg.type, ws.id, '→', peer.id);
+          safeSend(peer, msg);
+        }
         break;
       }
 
-      /* ───── COLLAPSE ───── */
-
       case "collapse": {
+        log('[COLLAPSE]', ws.id);
         const peer = getPeer(ws);
         if (peer) safeSend(peer, { type: "collapse", reason: msg.reason });
         cleanup(ws);
         break;
       }
 
-      /* ───── KNOCK SYSTEM ───── */
-
       case "register_knock":
         ws.knockName = msg.name;
         knocks.set(msg.name, ws);
+        log('[KNOCK REGISTER]', msg.name);
         break;
 
       case "knock_response": {
         const target = knocks.get(msg.id);
-        if (target) safeSend(target, msg);
+        if (target) {
+          log('[KNOCK RESPONSE]', msg.id);
+          safeSend(target, msg);
+        }
         break;
       }
     }
   });
 
   ws.on("close", () => {
+    log('[WS CLOSE]', ws.id, ws.sessionId);
     const peer = getPeer(ws);
     if (peer) safeSend(peer, { type: "collapse", reason: "peer_lost" });
     cleanup(ws);
@@ -144,27 +150,31 @@ function cleanup(ws) {
     if (s) {
       if (s.a === ws) s.a = null;
       if (s.b === ws) s.b = null;
-      if (!s.a && !s.b) sessions.delete(ws.sessionId);
+      if (!s.a && !s.b) {
+        sessions.delete(ws.sessionId);
+        log('[SESSION REMOVED]', ws.sessionId);
+      }
     }
   }
-
-  if (ws.knockName) {
-    knocks.delete(ws.knockName);
-  }
+  if (ws.knockName) knocks.delete(ws.knockName);
 }
 
 /* ───────────────── HEARTBEAT ───────────────── */
 
 setInterval(() => {
   wss.clients.forEach((ws) => {
-    if (!ws.isAlive) return ws.terminate();
+    if (!ws.isAlive) {
+      log('[TERMINATE]', ws.id);
+      return ws.terminate();
+    }
     ws.isAlive = false;
     ws.ping();
+    log('[PING OUT]', ws.id);
   });
 }, HEARTBEAT_INTERVAL);
 
 /* ───────────────── START ───────────────── */
 
 server.listen(PORT, () => {
-  console.log(`Presence server running on ${PORT}`);
+  log('SERVER STARTED', PORT);
 });
