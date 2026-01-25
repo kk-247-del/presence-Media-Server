@@ -1,6 +1,10 @@
 /**
  * Presence Media / Signaling Server
- * Railway-compatible, WebRTC-ready, log-safe
+ * Locus Class compliant:
+ * - Pure relay
+ * - No persistence
+ * - No media awareness
+ * - Deterministic teardown
  */
 
 import http from "http";
@@ -11,16 +15,14 @@ import crypto from "crypto";
 
 const PORT = process.env.PORT || 8080;
 const HEARTBEAT_INTERVAL = 20000;
+const SDP_TIMEOUT_MS = 15000; // ⏱ collapse if no SDP after ready
 
 /* ───────────────── STATE ───────────────── */
 
-// sessionId -> { a: ws|null, b: ws|null }
+// sessionId -> { a, b, sdpStarted, sdpTimer }
 const sessions = new Map();
 
-// knockName -> ws
-const knocks = new Map();
-
-/* ───────────────── LOGGING (NO BUFFERING) ───────────────── */
+/* ───────────────── LOGGING ───────────────── */
 
 function log(...args) {
   process.stdout.write(
@@ -48,21 +50,21 @@ function getPeer(ws) {
 }
 
 function cleanup(ws) {
-  if (ws.sessionId) {
-    const s = sessions.get(ws.sessionId);
-    if (s) {
-      if (s.a === ws) s.a = null;
-      if (s.b === ws) s.b = null;
-      if (!s.a && !s.b) {
-        sessions.delete(ws.sessionId);
-        log("SESSION_REMOVED", ws.sessionId);
-      }
-    }
+  if (!ws.sessionId) return;
+
+  const s = sessions.get(ws.sessionId);
+  if (!s) return;
+
+  if (s.a === ws) s.a = null;
+  if (s.b === ws) s.b = null;
+
+  if (s.sdpTimer) {
+    clearTimeout(s.sdpTimer);
   }
 
-  if (ws.knockName) {
-    knocks.delete(ws.knockName);
-    log("KNOCK_REMOVED", ws.knockName);
+  if (!s.a && !s.b) {
+    sessions.delete(ws.sessionId);
+    log("SESSION_REMOVED", ws.sessionId);
   }
 }
 
@@ -80,7 +82,6 @@ const wss = new WebSocketServer({ server });
 wss.on("connection", (ws, req) => {
   ws.id = uid();
   ws.sessionId = null;
-  ws.knockName = null;
   ws.isAlive = true;
 
   log("WS_CONNECT", ws.id, req.socket.remoteAddress ?? "");
@@ -106,7 +107,7 @@ wss.on("connection", (ws, req) => {
     log("MSG", ws.id, msg.type);
 
     switch (msg.type) {
-      /* ───────── PRESENCE / SESSION ───────── */
+      /* ───────── SESSION JOIN ───────── */
 
       case "join": {
         const sessionId = msg.address || msg.linkToken;
@@ -119,7 +120,12 @@ wss.on("connection", (ws, req) => {
 
         let session = sessions.get(sessionId);
         if (!session) {
-          session = { a: ws, b: null };
+          session = {
+            a: ws,
+            b: null,
+            sdpStarted: false,
+            sdpTimer: null,
+          };
           sessions.set(sessionId, session);
           log("SESSION_CREATED", sessionId, "A=", ws.id);
           return;
@@ -128,8 +134,26 @@ wss.on("connection", (ws, req) => {
         if (!session.b) {
           session.b = ws;
           log("SESSION_READY", sessionId, "A=", session.a?.id, "B=", ws.id);
+
           safeSend(session.a, { type: "ready" });
           safeSend(session.b, { type: "ready" });
+
+          // ⏱ SDP watchdog
+          session.sdpTimer = setTimeout(() => {
+            if (!session.sdpStarted) {
+              log("SDP_TIMEOUT", sessionId);
+              safeSend(session.a, {
+                type: "collapse",
+                reason: "sdp_timeout",
+              });
+              safeSend(session.b, {
+                type: "collapse",
+                reason: "sdp_timeout",
+              });
+              cleanup(session.a);
+              cleanup(session.b);
+            }
+          }, SDP_TIMEOUT_MS);
         } else {
           log("SESSION_FULL", sessionId);
         }
@@ -137,18 +161,11 @@ wss.on("connection", (ws, req) => {
       }
 
       case "ping":
-        log("PING", ws.id);
         safeSend(ws, { type: "pong" });
         break;
 
-      /* ───────── RELAY (APP + WEBRTC) ───────── */
+      /* ───────── WEBRTC RELAY (CRITICAL) ───────── */
 
-      case "text":
-      case "hold":
-      case "clear":
-      case "reveal_frame":
-
-      // 🔥 WEBRTC SIGNALING (CRITICAL)
       case "webrtc_offer":
       case "webrtc_answer":
       case "webrtc_ice": {
@@ -157,6 +174,26 @@ wss.on("connection", (ws, req) => {
           log("RELAY_FAIL_NO_PEER", ws.id, msg.type);
           return;
         }
+
+        const session = sessions.get(ws.sessionId);
+        if (session && !session.sdpStarted) {
+          session.sdpStarted = true;
+          log("SDP_STARTED", ws.sessionId);
+        }
+
+        log("RELAY", msg.type, ws.id, "→", peer.id);
+        safeSend(peer, msg);
+        break;
+      }
+
+      /* ───────── LIVE / REVEAL RELAY ───────── */
+
+      case "text":
+      case "hold":
+      case "clear":
+      case "reveal_frame": {
+        const peer = getPeer(ws);
+        if (!peer) return;
         log("RELAY", msg.type, ws.id, "→", peer.id);
         safeSend(peer, msg);
         break;
@@ -177,31 +214,12 @@ wss.on("connection", (ws, req) => {
         break;
       }
 
-      /* ───────── KNOCK SYSTEM ───────── */
-
-      case "register_knock":
-        ws.knockName = msg.name;
-        knocks.set(msg.name, ws);
-        log("KNOCK_REGISTER", msg.name, ws.id);
-        break;
-
-      case "knock_response": {
-        const target = knocks.get(msg.id);
-        if (target) {
-          log("KNOCK_RESPONSE", msg.id, ws.id);
-          safeSend(target, msg);
-        } else {
-          log("KNOCK_RESPONSE_FAIL", msg.id);
-        }
-        break;
-      }
-
       default:
         log("UNKNOWN_TYPE", ws.id, msg.type);
     }
   });
 
-  /* ───── CLOSE ───── */
+  /* ───── CLOSE / ERROR ───── */
 
   ws.on("close", () => {
     log("WS_CLOSE", ws.id, ws.sessionId ?? "");
