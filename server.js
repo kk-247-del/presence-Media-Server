@@ -1,6 +1,6 @@
 /**
  * Presence Media / Signaling Server
- * Railway-compatible, log-safe, WebSocket-first
+ * Railway-compatible, WebRTC-ready, log-safe
  */
 
 import http from "http";
@@ -37,6 +37,32 @@ function uid() {
 function safeSend(ws, obj) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(obj));
+  }
+}
+
+function getPeer(ws) {
+  if (!ws.sessionId) return null;
+  const s = sessions.get(ws.sessionId);
+  if (!s) return null;
+  return s.a === ws ? s.b : s.a;
+}
+
+function cleanup(ws) {
+  if (ws.sessionId) {
+    const s = sessions.get(ws.sessionId);
+    if (s) {
+      if (s.a === ws) s.a = null;
+      if (s.b === ws) s.b = null;
+      if (!s.a && !s.b) {
+        sessions.delete(ws.sessionId);
+        log("SESSION_REMOVED", ws.sessionId);
+      }
+    }
+  }
+
+  if (ws.knockName) {
+    knocks.delete(ws.knockName);
+    log("KNOCK_REMOVED", ws.knockName);
   }
 }
 
@@ -115,15 +141,20 @@ wss.on("connection", (ws, req) => {
         safeSend(ws, { type: "pong" });
         break;
 
-      /* ───────── RELAY MESSAGES ───────── */
+      /* ───────── RELAY (APP + WEBRTC) ───────── */
 
       case "text":
       case "hold":
       case "clear":
-      case "reveal_frame": {
+      case "reveal_frame":
+
+      // 🔥 WEBRTC SIGNALING (CRITICAL)
+      case "webrtc_offer":
+      case "webrtc_answer":
+      case "webrtc_ice": {
         const peer = getPeer(ws);
         if (!peer) {
-          log("RELAY_FAIL_NO_PEER", ws.id);
+          log("RELAY_FAIL_NO_PEER", ws.id, msg.type);
           return;
         }
         log("RELAY", msg.type, ws.id, "→", peer.id);
@@ -188,34 +219,6 @@ wss.on("connection", (ws, req) => {
     log("WS_ERROR", ws.id, e.message);
   });
 });
-
-/* ───────────────── UTILITIES ───────────────── */
-
-function getPeer(ws) {
-  if (!ws.sessionId) return null;
-  const s = sessions.get(ws.sessionId);
-  if (!s) return null;
-  return s.a === ws ? s.b : s.a;
-}
-
-function cleanup(ws) {
-  if (ws.sessionId) {
-    const s = sessions.get(ws.sessionId);
-    if (s) {
-      if (s.a === ws) s.a = null;
-      if (s.b === ws) s.b = null;
-      if (!s.a && !s.b) {
-        sessions.delete(ws.sessionId);
-        log("SESSION_REMOVED", ws.sessionId);
-      }
-    }
-  }
-
-  if (ws.knockName) {
-    knocks.delete(ws.knockName);
-    log("KNOCK_REMOVED", ws.knockName);
-  }
-}
 
 /* ───────────────── SERVER HEARTBEAT ───────────────── */
 
