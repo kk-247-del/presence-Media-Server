@@ -1,6 +1,6 @@
 /**
  * Presence Media / Signaling Server
- * Pure WebSocket relay (no Dart, no Flutter)
+ * FINAL – SDP-safe, role-aware, no premature collapse
  */
 
 import http from "http";
@@ -11,11 +11,10 @@ import crypto from "crypto";
 
 const PORT = process.env.PORT || 8080;
 const HEARTBEAT_INTERVAL = 20000;
-const SDP_TIMEOUT_MS = 15000;
 
 /* ───────────────── STATE ───────────────── */
 
-// sessionId -> { a, b, sdpStarted, sdpTimer }
+// sessionId → { a: ws|null, b: ws|null }
 const sessions = new Map();
 
 /* ───────────────── LOGGING ───────────────── */
@@ -26,15 +25,13 @@ function log(...args) {
   );
 }
 
-/* ───────────────── HELPERS ───────────────── */
-
 function uid() {
   return crypto.randomUUID();
 }
 
-function safeSend(ws, obj) {
+function safeSend(ws, msg) {
   if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(obj));
+    ws.send(JSON.stringify(msg));
   }
 }
 
@@ -47,10 +44,9 @@ function getPeer(ws) {
 
 function cleanup(ws) {
   if (!ws.sessionId) return;
+
   const s = sessions.get(ws.sessionId);
   if (!s) return;
-
-  if (s.sdpTimer) clearTimeout(s.sdpTimer);
 
   if (s.a === ws) s.a = null;
   if (s.b === ws) s.b = null;
@@ -61,14 +57,14 @@ function cleanup(ws) {
   }
 }
 
-/* ───────────────── HTTP SERVER ───────────────── */
+/* ───────────────── HTTP ───────────────── */
 
 const server = http.createServer((_, res) => {
   res.writeHead(200);
-  res.end("Presence media server alive");
+  res.end("Presence signaling server alive");
 });
 
-/* ───────────────── WEBSOCKET SERVER ───────────────── */
+/* ───────────────── WEBSOCKET ───────────────── */
 
 const wss = new WebSocketServer({ server });
 
@@ -95,6 +91,8 @@ wss.on("connection", (ws, req) => {
     log("MSG", ws.id, msg.type);
 
     switch (msg.type) {
+      /* ───────── JOIN ───────── */
+
       case "join": {
         const sessionId = msg.address || msg.linkToken;
         if (!sessionId) return;
@@ -103,52 +101,43 @@ wss.on("connection", (ws, req) => {
 
         let s = sessions.get(sessionId);
         if (!s) {
-          s = { a: ws, b: null, sdpStarted: false, sdpTimer: null };
-          sessions.set(sessionId, s);
+          sessions.set(sessionId, { a: ws, b: null });
           log("SESSION_CREATED", sessionId, "A=", ws.id);
           return;
         }
 
         if (!s.b) {
           s.b = ws;
-          log("SESSION_READY", sessionId);
+          log("SESSION_READY", sessionId, "A=", s.a.id, "B=", ws.id);
 
-          safeSend(s.a, { type: "ready" });
-          safeSend(s.b, { type: "ready" });
-
-          s.sdpTimer = setTimeout(() => {
-            if (!s.sdpStarted) {
-              log("SDP_TIMEOUT", sessionId);
-              safeSend(s.a, { type: "collapse", reason: "sdp_timeout" });
-              safeSend(s.b, { type: "collapse", reason: "sdp_timeout" });
-              cleanup(s.a);
-              cleanup(s.b);
-            }
-          }, SDP_TIMEOUT_MS);
+          safeSend(s.a, { type: "ready", role: "initiator" });
+          safeSend(s.b, { type: "ready", role: "polite" });
         }
         break;
       }
+
+      /* ───────── HEARTBEAT ───────── */
 
       case "ping":
         safeSend(ws, { type: "pong" });
         break;
 
+      /* ───────── RELAY ───────── */
+
       case "webrtc_offer":
       case "webrtc_answer":
-      case "webrtc_ice": {
+      case "webrtc_ice":
+      case "text":
+      case "hold":
+      case "clear":
+      case "reveal_frame": {
         const peer = getPeer(ws);
         if (!peer) return;
-
-        const s = sessions.get(ws.sessionId);
-        if (s && !s.sdpStarted) {
-          s.sdpStarted = true;
-          log("SDP_STARTED", ws.sessionId);
-        }
-
-        log("RELAY", msg.type, ws.id, "→", peer.id);
         safeSend(peer, msg);
         break;
       }
+
+      /* ───────── EXPLICIT COLLAPSE ───────── */
 
       case "collapse": {
         const peer = getPeer(ws);
@@ -161,9 +150,6 @@ wss.on("connection", (ws, req) => {
         cleanup(ws);
         break;
       }
-
-      default:
-        log("UNKNOWN_TYPE", ws.id, msg.type);
     }
   });
 
@@ -171,13 +157,20 @@ wss.on("connection", (ws, req) => {
     log("WS_CLOSE", ws.id);
     const peer = getPeer(ws);
     if (peer) {
-      safeSend(peer, { type: "collapse", reason: "peer_lost" });
+      safeSend(peer, {
+        type: "collapse",
+        reason: "peer_lost",
+      });
     }
     cleanup(ws);
   });
+
+  ws.on("error", (e) => {
+    log("WS_ERROR", ws.id, e.message);
+  });
 });
 
-/* ───────────────── HEARTBEAT ───────────────── */
+/* ───────────────── HEARTBEAT SWEEP ───────────────── */
 
 setInterval(() => {
   wss.clients.forEach((ws) => {
