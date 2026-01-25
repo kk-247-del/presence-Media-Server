@@ -1,283 +1,197 @@
-import 'package:flutter/foundation.dart';
-import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:flutter_webrtc/flutter_webrtc.dart';
+/**
+ * Presence Media / Signaling Server
+ * Pure WebSocket relay (no Dart, no Flutter)
+ */
 
-/* ───────────────── SIGNAL BRIDGE ───────────────── */
+import http from "http";
+import WebSocket, { WebSocketServer } from "ws";
+import crypto from "crypto";
 
-final mediaSignalBridgeProvider =
-    StateProvider<void Function(Map<String, dynamic>)>(
-  (_) => (_) {},
-);
+/* ───────────────── CONFIG ───────────────── */
 
-/* ───────────────── PROVIDER ───────────────── */
-
-final mediaEngineProvider = StateNotifierProvider<MediaEngine, MediaState>(
-  (ref) => MediaEngine(
-    ref,
-    sendSignal: (payload) =>
-        ref.read(mediaSignalBridgeProvider)(payload),
-  ),
-);
+const PORT = process.env.PORT || 8080;
+const HEARTBEAT_INTERVAL = 20000;
+const SDP_TIMEOUT_MS = 15000;
 
 /* ───────────────── STATE ───────────────── */
 
-enum MediaConnectionState { idle, warming, connected, failed }
+// sessionId -> { a, b, sdpStarted, sdpTimer }
+const sessions = new Map();
 
-class MediaState {
-  final bool audioLive;
-  final bool videoLive;
-  final bool ready;
-  final MediaConnectionState connection;
+/* ───────────────── LOGGING ───────────────── */
 
-  const MediaState({
-    required this.audioLive,
-    required this.videoLive,
-    required this.ready,
-    required this.connection,
-  });
-
-  static const idle = MediaState(
-    audioLive: false,
-    videoLive: false,
-    ready: false,
-    connection: MediaConnectionState.idle,
+function log(...args) {
+  process.stdout.write(
+    `[${new Date().toISOString()}] ${args.join(" ")}\n`
   );
+}
 
-  MediaState copyWith({
-    bool? audioLive,
-    bool? videoLive,
-    bool? ready,
-    MediaConnectionState? connection,
-  }) {
-    return MediaState(
-      audioLive: audioLive ?? this.audioLive,
-      videoLive: videoLive ?? this.videoLive,
-      ready: ready ?? this.ready,
-      connection: connection ?? this.connection,
-    );
+/* ───────────────── HELPERS ───────────────── */
+
+function uid() {
+  return crypto.randomUUID();
+}
+
+function safeSend(ws, obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(obj));
   }
 }
 
-/* ───────────────── ENGINE ───────────────── */
+function getPeer(ws) {
+  if (!ws.sessionId) return null;
+  const s = sessions.get(ws.sessionId);
+  if (!s) return null;
+  return s.a === ws ? s.b : s.a;
+}
 
-class MediaEngine extends StateNotifier<MediaState> {
-  final Ref ref;
-  final void Function(Map<String, dynamic>) _sendSignal;
+function cleanup(ws) {
+  if (!ws.sessionId) return;
+  const s = sessions.get(ws.sessionId);
+  if (!s) return;
 
-  MediaEngine(
-    this.ref, {
-    required void Function(Map<String, dynamic>) sendSignal,
-  })  : _sendSignal = sendSignal,
-        super(MediaState.idle);
+  if (s.sdpTimer) clearTimeout(s.sdpTimer);
 
-  RTCPeerConnection? _pc;
-  MediaStream? _local;
-  MediaStream? _remote;
+  if (s.a === ws) s.a = null;
+  if (s.b === ws) s.b = null;
 
-  RTCRtpTransceiver? _audioTx;
-  RTCRtpTransceiver? _videoTx;
-
-  bool _makingOffer = false;
-  bool _polite = false;
-
-  MediaStream? get localStream => _local;
-  MediaStream? get remoteStream => _remote;
-  bool get isPolite => _polite;
-
-  void setPolite(bool polite) {
-    _polite = polite;
-    _log(polite ? 'Polite peer' : 'Impolite peer');
+  if (!s.a && !s.b) {
+    sessions.delete(ws.sessionId);
+    log("SESSION_REMOVED", ws.sessionId);
   }
+}
 
-  void _log(String msg) {
-    final line = '[MEDIA] $msg';
-    if (kIsWeb) {
-      // ignore: avoid_print
-      print(line);
-    } else {
-      debugPrint(line);
-    }
-  }
+/* ───────────────── HTTP SERVER ───────────────── */
 
-  /* ───────────────── MEDIA WARM-UP ───────────────── */
+const server = http.createServer((_, res) => {
+  res.writeHead(200);
+  res.end("Presence media server alive");
+});
 
-  Future<void> warmUpMedia() async {
-    if (state.ready) return;
+/* ───────────────── WEBSOCKET SERVER ───────────────── */
 
-    state = state.copyWith(connection: MediaConnectionState.warming);
+const wss = new WebSocketServer({ server });
 
-    _local = await navigator.mediaDevices.getUserMedia({
-      'audio': true,
-      'video': {
-        'facingMode': 'user',
-        'width': 1280,
-        'height': 720,
-        'frameRate': 30,
-      },
-    });
+wss.on("connection", (ws, req) => {
+  ws.id = uid();
+  ws.sessionId = null;
+  ws.isAlive = true;
 
-    _pc = await createPeerConnection({
-      'iceServers': [
-        {'urls': 'stun:stun.l.google.com:19302'},
-      ],
-    });
+  log("WS_CONNECT", ws.id, req.socket.remoteAddress ?? "");
 
-    // Explicit transceivers (required on Web)
-    _audioTx = await _pc!.addTransceiver(
-      kind: RTCRtpMediaType.RTCRtpMediaTypeAudio,
-      init: RTCRtpTransceiverInit(
-        direction: TransceiverDirection.SendRecv,
-      ),
-    );
+  ws.on("pong", () => {
+    ws.isAlive = true;
+  });
 
-    _videoTx = await _pc!.addTransceiver(
-      kind: RTCRtpMediaType.RTCRtpMediaTypeVideo,
-      init: RTCRtpTransceiverInit(
-        direction: TransceiverDirection.SendRecv,
-      ),
-    );
-
-    _pc!.onTrack = (event) {
-      _remote = event.streams.first;
-      _log('Remote track attached');
-    };
-
-    _pc!.onIceCandidate = (c) {
-      if (c.candidate == null) return;
-      _sendSignal({
-        'type': 'webrtc_ice',
-        'candidate': c.candidate,
-        'sdpMid': c.sdpMid,
-        'sdpMLineIndex': c.sdpMLineIndex,
-      });
-    };
-
-    _pc!.onConnectionState = (s) {
-      _log('PC state → $s');
-      if (s == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
-        state = state.copyWith(connection: MediaConnectionState.connected);
-      }
-      if (s == RTCPeerConnectionState.RTCPeerConnectionStateFailed) {
-        state = state.copyWith(connection: MediaConnectionState.failed);
-      }
-    };
-
-    state = state.copyWith(ready: true);
-    _log('Pipelines warm');
-  }
-
-  /* ───────────────── NEGOTIATION ───────────────── */
-
-  /// Initiator only. No signalingState guard here.
-  Future<void> maybeMakeOffer() async {
-    if (_pc == null || _makingOffer) return;
-
+  ws.on("message", (raw) => {
+    let msg;
     try {
-      _makingOffer = true;
-
-      final offer = await _pc!.createOffer();
-      await _pc!.setLocalDescription(offer);
-
-      _sendSignal({
-        'type': 'webrtc_offer',
-        'sdp': offer.sdp,
-        'sdpType': offer.type,
-      });
-
-      _log('Offer sent');
-    } finally {
-      _makingOffer = false;
-    }
-  }
-
-  /// Perfect Negotiation: glare-safe
-  Future<void> handleRemoteOffer(Map<String, dynamic> msg) async {
-    if (_pc == null) return;
-
-    final offer = RTCSessionDescription(
-      msg['sdp'],
-      msg['sdpType'],
-    );
-
-    final collision =
-        _makingOffer ||
-        _pc!.signalingState !=
-            RTCSignalingState.RTCSignalingStateStable;
-
-    if (!_polite && collision) {
-      _log('Ignoring offer (glare)');
+      msg = JSON.parse(raw.toString());
+    } catch {
+      log("BAD_JSON", ws.id);
       return;
     }
 
-    await _pc!.setRemoteDescription(offer);
+    log("MSG", ws.id, msg.type);
 
-    final answer = await _pc!.createAnswer();
-    await _pc!.setLocalDescription(answer);
+    switch (msg.type) {
+      case "join": {
+        const sessionId = msg.address || msg.linkToken;
+        if (!sessionId) return;
 
-    _sendSignal({
-      'type': 'webrtc_answer',
-      'sdp': answer.sdp,
-      'sdpType': answer.type,
-    });
+        ws.sessionId = sessionId;
 
-    _log('Answer sent');
-  }
+        let s = sessions.get(sessionId);
+        if (!s) {
+          s = { a: ws, b: null, sdpStarted: false, sdpTimer: null };
+          sessions.set(sessionId, s);
+          log("SESSION_CREATED", sessionId, "A=", ws.id);
+          return;
+        }
 
-  Future<void> handleRemoteAnswer(Map<String, dynamic> msg) async {
-    if (_pc == null) return;
+        if (!s.b) {
+          s.b = ws;
+          log("SESSION_READY", sessionId);
 
-    await _pc!.setRemoteDescription(
-      RTCSessionDescription(
-        msg['sdp'],
-        msg['sdpType'],
-      ),
-    );
+          safeSend(s.a, { type: "ready" });
+          safeSend(s.b, { type: "ready" });
 
-    _log('Answer applied');
-  }
+          s.sdpTimer = setTimeout(() => {
+            if (!s.sdpStarted) {
+              log("SDP_TIMEOUT", sessionId);
+              safeSend(s.a, { type: "collapse", reason: "sdp_timeout" });
+              safeSend(s.b, { type: "collapse", reason: "sdp_timeout" });
+              cleanup(s.a);
+              cleanup(s.b);
+            }
+          }, SDP_TIMEOUT_MS);
+        }
+        break;
+      }
 
-  Future<void> addIceCandidate(Map<String, dynamic> msg) async {
-    if (_pc == null) return;
+      case "ping":
+        safeSend(ws, { type: "pong" });
+        break;
 
-    await _pc!.addCandidate(
-      RTCIceCandidate(
-        msg['candidate'],
-        msg['sdpMid'],
-        msg['sdpMLineIndex'],
-      ),
-    );
-  }
+      case "webrtc_offer":
+      case "webrtc_answer":
+      case "webrtc_ice": {
+        const peer = getPeer(ws);
+        if (!peer) return;
 
-  /* ───────────────── ESCALATION ───────────────── */
+        const s = sessions.get(ws.sessionId);
+        if (s && !s.sdpStarted) {
+          s.sdpStarted = true;
+          log("SDP_STARTED", ws.sessionId);
+        }
 
-  Future<void> escalateAudio() async {
-    final track = _local!.getAudioTracks().first;
-    await _audioTx!.sender.replaceTrack(track);
-    state = state.copyWith(audioLive: true);
-    _log('Audio escalated');
-  }
+        log("RELAY", msg.type, ws.id, "→", peer.id);
+        safeSend(peer, msg);
+        break;
+      }
 
-  Future<void> escalateVideo() async {
-    final track = _local!.getVideoTracks().first;
-    await _videoTx!.sender.replaceTrack(track);
-    state = state.copyWith(videoLive: true);
-    _log('Video escalated');
-  }
+      case "collapse": {
+        const peer = getPeer(ws);
+        if (peer) {
+          safeSend(peer, {
+            type: "collapse",
+            reason: msg.reason ?? "peer_exit",
+          });
+        }
+        cleanup(ws);
+        break;
+      }
 
-  /* ───────────────── TEARDOWN ───────────────── */
-
-  Future<void> disposeMedia() async {
-    _log('Dispose media');
-
-    for (final t in _local?.getTracks() ?? []) {
-      await t.stop();
+      default:
+        log("UNKNOWN_TYPE", ws.id, msg.type);
     }
-    await _pc?.close();
+  });
 
-    _pc = null;
-    _local = null;
-    _remote = null;
+  ws.on("close", () => {
+    log("WS_CLOSE", ws.id);
+    const peer = getPeer(ws);
+    if (peer) {
+      safeSend(peer, { type: "collapse", reason: "peer_lost" });
+    }
+    cleanup(ws);
+  });
+});
 
-    state = MediaState.idle;
-  }
-}
+/* ───────────────── HEARTBEAT ───────────────── */
+
+setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (!ws.isAlive) {
+      log("TERMINATE", ws.id);
+      return ws.terminate();
+    }
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, HEARTBEAT_INTERVAL);
+
+/* ───────────────── START ───────────────── */
+
+server.listen(PORT, () => {
+  log("SERVER_STARTED", PORT);
+});
