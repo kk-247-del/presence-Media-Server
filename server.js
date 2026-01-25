@@ -1,23 +1,19 @@
 /**
  * Presence Media / Signaling Server
- * FINAL – SDP-safe, role-aware, no premature collapse
+ * FIXED – explicit /ws path, Railway-safe
  */
 
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
 import crypto from "crypto";
 
-/* ───────────────── CONFIG ───────────────── */
-
 const PORT = process.env.PORT || 8080;
 const HEARTBEAT_INTERVAL = 20000;
-
-/* ───────────────── STATE ───────────────── */
 
 // sessionId → { a: ws|null, b: ws|null }
 const sessions = new Map();
 
-/* ───────────────── LOGGING ───────────────── */
+/* ───────── LOGGING ───────── */
 
 function log(...args) {
   process.stdout.write(
@@ -44,7 +40,6 @@ function getPeer(ws) {
 
 function cleanup(ws) {
   if (!ws.sessionId) return;
-
   const s = sessions.get(ws.sessionId);
   if (!s) return;
 
@@ -57,16 +52,23 @@ function cleanup(ws) {
   }
 }
 
-/* ───────────────── HTTP ───────────────── */
+/* ───────── HTTP ───────── */
 
-const server = http.createServer((_, res) => {
+const server = http.createServer((req, res) => {
+  if (req.url === "/health") {
+    res.writeHead(200);
+    return res.end("OK");
+  }
   res.writeHead(200);
   res.end("Presence signaling server alive");
 });
 
-/* ───────────────── WEBSOCKET ───────────────── */
+/* ───────── WEBSOCKET (/ws) ───────── */
 
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({
+  server,
+  path: "/ws", // 🔑 REQUIRED for Flutter Web
+});
 
 wss.on("connection", (ws, req) => {
   ws.id = uid();
@@ -84,60 +86,44 @@ wss.on("connection", (ws, req) => {
     try {
       msg = JSON.parse(raw.toString());
     } catch {
-      log("BAD_JSON", ws.id);
       return;
     }
 
-    log("MSG", ws.id, msg.type);
-
     switch (msg.type) {
-      /* ───────── JOIN ───────── */
-
       case "join": {
         const sessionId = msg.address || msg.linkToken;
         if (!sessionId) return;
 
         ws.sessionId = sessionId;
-
         let s = sessions.get(sessionId);
+
         if (!s) {
           sessions.set(sessionId, { a: ws, b: null });
-          log("SESSION_CREATED", sessionId, "A=", ws.id);
           return;
         }
 
         if (!s.b) {
           s.b = ws;
-          log("SESSION_READY", sessionId, "A=", s.a.id, "B=", ws.id);
-
           safeSend(s.a, { type: "ready", role: "initiator" });
           safeSend(s.b, { type: "ready", role: "polite" });
         }
         break;
       }
 
-      /* ───────── HEARTBEAT ───────── */
-
       case "ping":
         safeSend(ws, { type: "pong" });
         break;
-
-      /* ───────── RELAY ───────── */
 
       case "webrtc_offer":
       case "webrtc_answer":
       case "webrtc_ice":
       case "text":
       case "hold":
-      case "clear":
-      case "reveal_frame": {
+      case "clear": {
         const peer = getPeer(ws);
-        if (!peer) return;
-        safeSend(peer, msg);
+        if (peer) safeSend(peer, msg);
         break;
       }
-
-      /* ───────── EXPLICIT COLLAPSE ───────── */
 
       case "collapse": {
         const peer = getPeer(ws);
@@ -154,37 +140,26 @@ wss.on("connection", (ws, req) => {
   });
 
   ws.on("close", () => {
-    log("WS_CLOSE", ws.id);
     const peer = getPeer(ws);
     if (peer) {
-      safeSend(peer, {
-        type: "collapse",
-        reason: "peer_lost",
-      });
+      safeSend(peer, { type: "collapse", reason: "peer_lost" });
     }
     cleanup(ws);
   });
-
-  ws.on("error", (e) => {
-    log("WS_ERROR", ws.id, e.message);
-  });
 });
 
-/* ───────────────── HEARTBEAT SWEEP ───────────────── */
+/* ───────── HEARTBEAT ───────── */
 
 setInterval(() => {
   wss.clients.forEach((ws) => {
-    if (!ws.isAlive) {
-      log("TERMINATE", ws.id);
-      return ws.terminate();
-    }
+    if (!ws.isAlive) return ws.terminate();
     ws.isAlive = false;
     ws.ping();
   });
 }, HEARTBEAT_INTERVAL);
 
-/* ───────────────── START ───────────────── */
+/* ───────── START ───────── */
 
-server.listen(PORT, () => {
+server.listen(PORT, "0.0.0.0", () => {
   log("SERVER_STARTED", PORT);
 });
