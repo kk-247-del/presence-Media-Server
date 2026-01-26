@@ -1,6 +1,6 @@
 /**
  * Presence Media / Signaling Server
- * FIXED – explicit /ws path, Railway-safe
+ * Railway-safe, session relay only
  */
 
 import http from "http";
@@ -67,7 +67,7 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({
   server,
-  path: "/ws", // 🔑 REQUIRED for Flutter Web
+  path: "/ws",
 });
 
 wss.on("connection", (ws, req) => {
@@ -119,7 +119,9 @@ wss.on("connection", (ws, req) => {
       case "webrtc_ice":
       case "text":
       case "hold":
-      case "clear": {
+      case "clear":
+      case "peer_obstructed":
+      case "peer_restored": {
         const peer = getPeer(ws);
         if (peer) safeSend(peer, msg);
         break;
