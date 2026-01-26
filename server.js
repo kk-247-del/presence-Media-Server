@@ -1,6 +1,6 @@
 /**
  * Presence Media / Signaling Server
- * ICE-SAFE – Android/Web compatible
+ * FIXED – explicit /ws path, Railway-safe
  */
 
 import http from "http";
@@ -10,13 +10,15 @@ import crypto from "crypto";
 const PORT = process.env.PORT || 8080;
 const HEARTBEAT_INTERVAL = 20000;
 
-// sessionId → { a, b, sdpReady: Map<ws,bool>, iceQueue: Map<ws,[]> }
+// sessionId → { a: ws|null, b: ws|null }
 const sessions = new Map();
 
-/* ───────── UTILS ───────── */
+/* ───────── LOGGING ───────── */
 
 function log(...args) {
-  process.stdout.write(`[${new Date().toISOString()}] ${args.join(" ")}\n`);
+  process.stdout.write(
+    `[${new Date().toISOString()}] ${args.join(" ")}\n`
+  );
 }
 
 function uid() {
@@ -30,17 +32,16 @@ function safeSend(ws, msg) {
 }
 
 function getPeer(ws) {
+  if (!ws.sessionId) return null;
   const s = sessions.get(ws.sessionId);
   if (!s) return null;
   return s.a === ws ? s.b : s.a;
 }
 
 function cleanup(ws) {
+  if (!ws.sessionId) return;
   const s = sessions.get(ws.sessionId);
   if (!s) return;
-
-  s.sdpReady.delete(ws);
-  s.iceQueue.delete(ws);
 
   if (s.a === ws) s.a = null;
   if (s.b === ws) s.b = null;
@@ -62,11 +63,11 @@ const server = http.createServer((req, res) => {
   res.end("Presence signaling server alive");
 });
 
-/* ───────── WEBSOCKET ───────── */
+/* ───────── WEBSOCKET (/ws) ───────── */
 
 const wss = new WebSocketServer({
   server,
-  path: "/ws",
+  path: "/ws", // 🔑 REQUIRED for Flutter Web
 });
 
 wss.on("connection", (ws, req) => {
@@ -74,9 +75,11 @@ wss.on("connection", (ws, req) => {
   ws.sessionId = null;
   ws.isAlive = true;
 
-  log("WS_CONNECT", ws.id);
+  log("WS_CONNECT", ws.id, req.socket.remoteAddress ?? "");
 
-  ws.on("pong", () => (ws.isAlive = true));
+  ws.on("pong", () => {
+    ws.isAlive = true;
+  });
 
   ws.on("message", (raw) => {
     let msg;
@@ -88,74 +91,48 @@ wss.on("connection", (ws, req) => {
 
     switch (msg.type) {
       case "join": {
-        const id = msg.address || msg.linkToken;
-        if (!id) return;
+        const sessionId = msg.address || msg.linkToken;
+        if (!sessionId) return;
 
-        ws.sessionId = id;
+        ws.sessionId = sessionId;
+        let s = sessions.get(sessionId);
 
-        let s = sessions.get(id);
         if (!s) {
-          s = {
-            a: ws,
-            b: null,
-            sdpReady: new Map(),
-            iceQueue: new Map(),
-          };
-          sessions.set(id, s);
+          sessions.set(sessionId, { a: ws, b: null });
           return;
         }
 
         if (!s.b) {
           s.b = ws;
-
-          s.sdpReady.set(s.a, false);
-          s.sdpReady.set(s.b, false);
-
-          s.iceQueue.set(s.a, []);
-          s.iceQueue.set(s.b, []);
-
           safeSend(s.a, { type: "ready", role: "initiator" });
           safeSend(s.b, { type: "ready", role: "polite" });
         }
         break;
       }
 
-      case "webrtc_offer":
-      case "webrtc_answer": {
-        const peer = getPeer(ws);
-        if (!peer) return;
-
-        safeSend(peer, msg);
-
-        // Mark SDP ready for sender
-        const s = sessions.get(ws.sessionId);
-        s.sdpReady.set(ws, true);
-
-        // Flush queued ICE to sender
-        const queued = s.iceQueue.get(ws) || [];
-        queued.forEach((c) => safeSend(ws, c));
-        s.iceQueue.set(ws, []);
-
+      case "ping":
+        safeSend(ws, { type: "pong" });
         break;
-      }
 
-      case "webrtc_ice": {
+      case "webrtc_offer":
+      case "webrtc_answer":
+      case "webrtc_ice":
+      case "text":
+      case "hold":
+      case "clear": {
         const peer = getPeer(ws);
-        if (!peer) return;
-
-        const s = sessions.get(ws.sessionId);
-        if (!s.sdpReady.get(peer)) {
-          s.iceQueue.get(peer).push(msg);
-          return;
-        }
-
-        safeSend(peer, msg);
+        if (peer) safeSend(peer, msg);
         break;
       }
 
       case "collapse": {
         const peer = getPeer(ws);
-        if (peer) safeSend(peer, { type: "collapse", reason: "peer_exit" });
+        if (peer) {
+          safeSend(peer, {
+            type: "collapse",
+            reason: msg.reason ?? "peer_exit",
+          });
+        }
         cleanup(ws);
         break;
       }
@@ -164,7 +141,9 @@ wss.on("connection", (ws, req) => {
 
   ws.on("close", () => {
     const peer = getPeer(ws);
-    if (peer) safeSend(peer, { type: "collapse", reason: "peer_lost" });
+    if (peer) {
+      safeSend(peer, { type: "collapse", reason: "peer_lost" });
+    }
     cleanup(ws);
   });
 });
