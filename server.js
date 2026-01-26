@@ -1,6 +1,6 @@
 /**
  * Presence Media / Signaling Server
- * FIXED – collapse is authoritative
+ * FIXED – authoritative roles, no SDP collisions
  */
 
 import http from "http";
@@ -50,16 +50,13 @@ function cleanup(ws) {
 
 /* ───────── HTTP ───────── */
 
-const server = http.createServer((req, res) => {
+const server = http.createServer((_, res) => {
   res.end("Presence signaling server alive");
 });
 
 /* ───────── WEBSOCKET (/ws) ───────── */
 
-const wss = new WebSocketServer({
-  server,
-  path: "/ws",
-});
+const wss = new WebSocketServer({ server, path: "/ws" });
 
 wss.on("connection", (ws) => {
   ws.id = uid();
@@ -95,8 +92,10 @@ wss.on("connection", (ws) => {
 
         if (!s.b) {
           s.b = ws;
-          safeSend(s.a, { type: "ready" });
-          safeSend(s.b, { type: "ready" });
+
+          // 🔑 AUTHORITATIVE ROLES
+          safeSend(s.a, { type: "ready", role: "initiator" });
+          safeSend(s.b, { type: "ready", role: "polite" });
         }
         break;
       }
@@ -123,10 +122,7 @@ wss.on("connection", (ws) => {
   ws.on("close", () => {
     const peer = getPeer(ws);
     if (peer) {
-      safeSend(peer, {
-        type: "collapse",
-        reason: "peer_lost",
-      });
+      safeSend(peer, { type: "collapse", reason: "peer_lost" });
     }
     cleanup(ws);
   });
