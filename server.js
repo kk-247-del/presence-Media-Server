@@ -1,6 +1,6 @@
 /**
  * Presence Media / Signaling Server
- * Railway-safe, session relay only
+ * FIXED – collapse is authoritative
  */
 
 import http from "http";
@@ -10,15 +10,11 @@ import crypto from "crypto";
 const PORT = process.env.PORT || 8080;
 const HEARTBEAT_INTERVAL = 20000;
 
-// sessionId → { a: ws|null, b: ws|null }
+// sessionId → { a, b }
 const sessions = new Map();
 
-/* ───────── LOGGING ───────── */
-
 function log(...args) {
-  process.stdout.write(
-    `[${new Date().toISOString()}] ${args.join(" ")}\n`
-  );
+  console.log(new Date().toISOString(), ...args);
 }
 
 function uid() {
@@ -55,11 +51,6 @@ function cleanup(ws) {
 /* ───────── HTTP ───────── */
 
 const server = http.createServer((req, res) => {
-  if (req.url === "/health") {
-    res.writeHead(200);
-    return res.end("OK");
-  }
-  res.writeHead(200);
   res.end("Presence signaling server alive");
 });
 
@@ -70,12 +61,12 @@ const wss = new WebSocketServer({
   path: "/ws",
 });
 
-wss.on("connection", (ws, req) => {
+wss.on("connection", (ws) => {
   ws.id = uid();
   ws.sessionId = null;
   ws.isAlive = true;
 
-  log("WS_CONNECT", ws.id, req.socket.remoteAddress ?? "");
+  log("WS_CONNECT", ws.id);
 
   ws.on("pong", () => {
     ws.isAlive = true;
@@ -104,26 +95,9 @@ wss.on("connection", (ws, req) => {
 
         if (!s.b) {
           s.b = ws;
-          safeSend(s.a, { type: "ready", role: "initiator" });
-          safeSend(s.b, { type: "ready", role: "polite" });
+          safeSend(s.a, { type: "ready" });
+          safeSend(s.b, { type: "ready" });
         }
-        break;
-      }
-
-      case "ping":
-        safeSend(ws, { type: "pong" });
-        break;
-
-      case "webrtc_offer":
-      case "webrtc_answer":
-      case "webrtc_ice":
-      case "text":
-      case "hold":
-      case "clear":
-      case "peer_obstructed":
-      case "peer_restored": {
-        const peer = getPeer(ws);
-        if (peer) safeSend(peer, msg);
         break;
       }
 
@@ -138,13 +112,21 @@ wss.on("connection", (ws, req) => {
         cleanup(ws);
         break;
       }
+
+      default: {
+        const peer = getPeer(ws);
+        if (peer) safeSend(peer, msg);
+      }
     }
   });
 
   ws.on("close", () => {
     const peer = getPeer(ws);
     if (peer) {
-      safeSend(peer, { type: "collapse", reason: "peer_lost" });
+      safeSend(peer, {
+        type: "collapse",
+        reason: "peer_lost",
+      });
     }
     cleanup(ws);
   });
