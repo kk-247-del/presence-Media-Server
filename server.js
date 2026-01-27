@@ -31,8 +31,7 @@ function safeSend(ws, msg) {
 }
 
 function getSession(ws) {
-  if (!ws.sessionId) return null;
-  return sessions.get(ws.sessionId) ?? null;
+  return ws.sessionId ? sessions.get(ws.sessionId) ?? null : null;
 }
 
 function getPeer(ws) {
@@ -41,16 +40,14 @@ function getPeer(ws) {
   return s.a === ws ? s.b : s.a;
 }
 
-/* ───────────────── COLLAPSE CONTROL ───────────────── */
+/* ───────────────── SOFT OBSTRUCTION ───────────────── */
 
-function startObstruction(ws, reason) {
-  const peer = getPeer(ws);
-  if (!peer) return;
+function startObstruction(actor, reason) {
+  const peer = getPeer(actor);
+  const s = getSession(actor);
+  if (!peer || !s) return;
 
-  const s = getSession(ws);
-  if (!s) return;
-
-  // prevent duplicate obstruction
+  // already obstructed
   if (s.timers.has(peer)) return;
 
   log("PEER_OBSTRUCTED", peer.id, reason);
@@ -63,28 +60,43 @@ function startObstruction(ws, reason) {
 
   const timer = setTimeout(() => {
     safeSend(peer, {
-      type: "collapse",
+      type: "collapse_grace_elapsed",
       reason: "grace_elapsed",
     });
-    cleanup(peer);
+    hardCollapse(peer, "grace_elapsed");
   }, COLLAPSE_GRACE_SECONDS * 1000);
 
   s.timers.set(peer, timer);
 }
 
-function cancelObstruction(ws) {
-  const s = getSession(ws);
+function cancelObstruction(actor) {
+  const s = getSession(actor);
   if (!s) return;
 
-  const timer = s.timers.get(ws);
-  if (timer) {
-    clearTimeout(timer);
-    s.timers.delete(ws);
+  const timer = s.timers.get(actor);
+  if (!timer) return;
 
-    safeSend(ws, { type: "peer_restored" });
-    log("PEER_RESTORED", ws.id);
-  }
+  clearTimeout(timer);
+  s.timers.delete(actor);
+
+  safeSend(actor, { type: "peer_restored" });
+  log("PEER_RESTORED", actor.id);
 }
+
+/* ───────────────── HARD COLLAPSE ───────────────── */
+
+function hardCollapse(ws, reason) {
+  const peer = getPeer(ws);
+  if (peer) {
+    safeSend(peer, {
+      type: "collapse_hard",
+      reason,
+    });
+  }
+  cleanup(ws);
+}
+
+/* ───────────────── CLEANUP ───────────────── */
 
 function cleanup(ws) {
   const s = getSession(ws);
@@ -146,23 +158,32 @@ wss.on("connection", (ws) => {
 
         if (!s.b) {
           s.b = ws;
-
-          // 🔑 AUTHORITATIVE ROLES
           safeSend(s.a, { type: "ready", role: "initiator" });
           safeSend(s.b, { type: "ready", role: "polite" });
         }
         break;
       }
 
-      case "collapse": {
+      case "collapse_user": {
         const peer = getPeer(ws);
         if (peer) {
           safeSend(peer, {
-            type: "collapse",
-            reason: msg.reason ?? "peer_exit",
+            type: "peer_obstructed",
+            reason: "remote_user_ended",
+            seconds: COLLAPSE_GRACE_SECONDS,
           });
         }
         cleanup(ws);
+        break;
+      }
+
+      case "collapse_hard": {
+        hardCollapse(ws, msg.reason ?? "hard_violation");
+        break;
+      }
+
+      case "peer_restored": {
+        cancelObstruction(ws);
         break;
       }
 
@@ -175,8 +196,7 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     log("WS_CLOSE", ws.id);
-    startObstruction(ws, "peer_lost");
-    cleanup(ws);
+    hardCollapse(ws, "socket_closed");
   });
 });
 
@@ -186,8 +206,9 @@ setInterval(() => {
   wss.clients.forEach((ws) => {
     if (!ws.isAlive) {
       log("WS_TIMEOUT", ws.id);
-      startObstruction(ws, "heartbeat_timeout");
-      return ws.terminate();
+      hardCollapse(ws, "heartbeat_timeout");
+      ws.terminate();
+      return;
     }
 
     ws.isAlive = false;
