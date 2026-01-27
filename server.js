@@ -1,6 +1,6 @@
 /**
  * Presence Media / Signaling Server
- * FIXED – authoritative roles, no SDP collisions
+ * AUTHORITATIVE – deterministic obstruction + collapse
  */
 
 import http from "http";
@@ -9,9 +9,12 @@ import crypto from "crypto";
 
 const PORT = process.env.PORT || 8080;
 const HEARTBEAT_INTERVAL = 20000;
+const COLLAPSE_GRACE_SECONDS = 10;
 
-// sessionId → { a, b }
+// sessionId → { a, b, timers: Map<ws, Timeout> }
 const sessions = new Map();
+
+/* ───────────────── UTILS ───────────────── */
 
 function log(...args) {
   console.log(new Date().toISOString(), ...args);
@@ -27,17 +30,67 @@ function safeSend(ws, msg) {
   }
 }
 
-function getPeer(ws) {
+function getSession(ws) {
   if (!ws.sessionId) return null;
-  const s = sessions.get(ws.sessionId);
+  return sessions.get(ws.sessionId) ?? null;
+}
+
+function getPeer(ws) {
+  const s = getSession(ws);
   if (!s) return null;
   return s.a === ws ? s.b : s.a;
 }
 
-function cleanup(ws) {
-  if (!ws.sessionId) return;
-  const s = sessions.get(ws.sessionId);
+/* ───────────────── COLLAPSE CONTROL ───────────────── */
+
+function startObstruction(ws, reason) {
+  const peer = getPeer(ws);
+  if (!peer) return;
+
+  const s = getSession(ws);
   if (!s) return;
+
+  // prevent duplicate obstruction
+  if (s.timers.has(peer)) return;
+
+  log("PEER_OBSTRUCTED", peer.id, reason);
+
+  safeSend(peer, {
+    type: "peer_obstructed",
+    seconds: COLLAPSE_GRACE_SECONDS,
+    reason,
+  });
+
+  const timer = setTimeout(() => {
+    safeSend(peer, {
+      type: "collapse",
+      reason: "grace_elapsed",
+    });
+    cleanup(peer);
+  }, COLLAPSE_GRACE_SECONDS * 1000);
+
+  s.timers.set(peer, timer);
+}
+
+function cancelObstruction(ws) {
+  const s = getSession(ws);
+  if (!s) return;
+
+  const timer = s.timers.get(ws);
+  if (timer) {
+    clearTimeout(timer);
+    s.timers.delete(ws);
+
+    safeSend(ws, { type: "peer_restored" });
+    log("PEER_RESTORED", ws.id);
+  }
+}
+
+function cleanup(ws) {
+  const s = getSession(ws);
+  if (!s) return;
+
+  cancelObstruction(ws);
 
   if (s.a === ws) s.a = null;
   if (s.b === ws) s.b = null;
@@ -48,13 +101,13 @@ function cleanup(ws) {
   }
 }
 
-/* ───────── HTTP ───────── */
+/* ───────────────── HTTP ───────────────── */
 
 const server = http.createServer((_, res) => {
   res.end("Presence signaling server alive");
 });
 
-/* ───────── WEBSOCKET (/ws) ───────── */
+/* ───────────────── WEBSOCKET ───────────────── */
 
 const wss = new WebSocketServer({ server, path: "/ws" });
 
@@ -83,10 +136,11 @@ wss.on("connection", (ws) => {
         if (!sessionId) return;
 
         ws.sessionId = sessionId;
-        let s = sessions.get(sessionId);
 
+        let s = sessions.get(sessionId);
         if (!s) {
-          sessions.set(sessionId, { a: ws, b: null });
+          s = { a: ws, b: null, timers: new Map() };
+          sessions.set(sessionId, s);
           return;
         }
 
@@ -120,25 +174,28 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
-    const peer = getPeer(ws);
-    if (peer) {
-      safeSend(peer, { type: "collapse", reason: "peer_lost" });
-    }
+    log("WS_CLOSE", ws.id);
+    startObstruction(ws, "peer_lost");
     cleanup(ws);
   });
 });
 
-/* ───────── HEARTBEAT ───────── */
+/* ───────────────── HEARTBEAT ───────────────── */
 
 setInterval(() => {
   wss.clients.forEach((ws) => {
-    if (!ws.isAlive) return ws.terminate();
+    if (!ws.isAlive) {
+      log("WS_TIMEOUT", ws.id);
+      startObstruction(ws, "heartbeat_timeout");
+      return ws.terminate();
+    }
+
     ws.isAlive = false;
     ws.ping();
   });
 }, HEARTBEAT_INTERVAL);
 
-/* ───────── START ───────── */
+/* ───────────────── START ───────────────── */
 
 server.listen(PORT, "0.0.0.0", () => {
   log("SERVER_STARTED", PORT);
