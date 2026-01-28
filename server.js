@@ -11,7 +11,14 @@ const PORT = process.env.PORT || 8080;
 const HEARTBEAT_INTERVAL = 20000;
 const COLLAPSE_GRACE_SECONDS = 10;
 
-// sessionId → { a, b, timers: Map<ws, Timeout> }
+/**
+ * sessionId → {
+ *   a: WebSocket | null,
+ *   b: WebSocket | null,
+ *   obstructionActive: boolean,
+ *   obstructionTimer: Timeout | null
+ * }
+ */
 const sessions = new Map();
 
 /* ───────────────── UTILS ───────────────── */
@@ -40,15 +47,19 @@ function getPeer(ws) {
   return s.a === ws ? s.b : s.a;
 }
 
-/* ───────────────── SOFT OBSTRUCTION ───────────────── */
+/* ───────────────── SOFT OBSTRUCTION (FIXED) ───────────────── */
 
 function startObstruction(actor, reason) {
-  const peer = getPeer(actor);
   const s = getSession(actor);
-  if (!peer || !s) return;
+  if (!s) return;
 
-  // already obstructed
-  if (s.timers.has(peer)) return;
+  // 🔒 HARD GUARD — already obstructed
+  if (s.obstructionActive) return;
+
+  const peer = getPeer(actor);
+  if (!peer) return;
+
+  s.obstructionActive = true;
 
   log("PEER_OBSTRUCTED", peer.id, reason);
 
@@ -58,34 +69,54 @@ function startObstruction(actor, reason) {
     reason,
   });
 
-  const timer = setTimeout(() => {
+  s.obstructionTimer = setTimeout(() => {
+    if (!s.obstructionActive) return;
+
+    log("GRACE_EXPIRED", actor.sessionId);
+
     safeSend(peer, {
       type: "collapse_grace_elapsed",
       reason: "grace_elapsed",
     });
-    hardCollapse(peer, "grace_elapsed");
-  }, COLLAPSE_GRACE_SECONDS * 1000);
 
-  s.timers.set(peer, timer);
+    hardCollapse(actor, "grace_elapsed");
+  }, COLLAPSE_GRACE_SECONDS * 1000);
 }
 
 function cancelObstruction(actor) {
   const s = getSession(actor);
   if (!s) return;
 
-  const timer = s.timers.get(actor);
-  if (!timer) return;
+  if (!s.obstructionActive) return;
 
-  clearTimeout(timer);
-  s.timers.delete(actor);
+  s.obstructionActive = false;
 
-  safeSend(actor, { type: "peer_restored" });
+  if (s.obstructionTimer) {
+    clearTimeout(s.obstructionTimer);
+    s.obstructionTimer = null;
+  }
+
+  const peer = getPeer(actor);
+  if (peer) {
+    safeSend(peer, { type: "peer_restored" });
+  }
+
   log("PEER_RESTORED", actor.id);
 }
 
 /* ───────────────── HARD COLLAPSE ───────────────── */
 
 function hardCollapse(ws, reason) {
+  const s = getSession(ws);
+  if (!s) return;
+
+  if (s.obstructionTimer) {
+    clearTimeout(s.obstructionTimer);
+    s.obstructionTimer = null;
+  }
+
+  s.obstructionActive = false;
+
   const peer = getPeer(ws);
   if (peer) {
     safeSend(peer, {
@@ -93,6 +124,7 @@ function hardCollapse(ws, reason) {
       reason,
     });
   }
+
   cleanup(ws);
 }
 
@@ -151,7 +183,12 @@ wss.on("connection", (ws) => {
 
         let s = sessions.get(sessionId);
         if (!s) {
-          s = { a: ws, b: null, timers: new Map() };
+          s = {
+            a: ws,
+            b: null,
+            obstructionActive: false,
+            obstructionTimer: null,
+          };
           sessions.set(sessionId, s);
           return;
         }
@@ -164,26 +201,18 @@ wss.on("connection", (ws) => {
         break;
       }
 
-      case "collapse_user": {
-        const peer = getPeer(ws);
-        if (peer) {
-          safeSend(peer, {
-            type: "peer_obstructed",
-            reason: "remote_user_ended",
-            seconds: COLLAPSE_GRACE_SECONDS,
-          });
-        }
-        cleanup(ws);
-        break;
-      }
-
-      case "collapse_hard": {
-        hardCollapse(ws, msg.reason ?? "hard_violation");
+      case "peer_obstructed": {
+        startObstruction(ws, msg.reason ?? "peer_obstructed");
         break;
       }
 
       case "peer_restored": {
         cancelObstruction(ws);
+        break;
+      }
+
+      case "collapse_hard": {
+        hardCollapse(ws, msg.reason ?? "hard_violation");
         break;
       }
 
