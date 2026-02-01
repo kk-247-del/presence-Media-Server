@@ -1,215 +1,229 @@
-/**
- * Presence Media / Signaling Server (Authoritative Registry)
- * Features: Identity, TTL Expiry, Dashboard Management, and One-Time Use Logic.
- */
+// ignore_for_file: avoid_print
 
-import http from "http";
-import WebSocket, { WebSocketServer } from "ws";
-import crypto from "crypto";
+import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
 
-const PORT = process.env.PORT || 8080;
-const HEARTBEAT_INTERVAL = 20000;
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
 
-/**
- * addressRegistry: addressId -> { 
- * addressId, creatorId, nickname, keepAliveOnFailure, expiresAt, status 
- * }
- */
-const addressRegistry = new Map();
+import '../knock/presence_lock_guard.dart';
+import '../models/presence_address.dart';
+import 'media_engine.dart';
 
-/**
- * sessions: addressId -> { a: WebSocket, b: WebSocket, obstructionTimer }
- */
-const sessions = new Map();
+/* ───────────────── LOGGING ───────────────── */
 
-/* ───────────────── UTILS ───────────────── */
-
-function log(...args) {
-  console.log(`[${new Date().toISOString()}]`, ...args);
+void momentLog(String msg) {
+  final line = '[PRESENCE][ENGINE] $msg';
+  kIsWeb ? print(line) : debugPrint(line);
 }
 
-function uid() {
-  return crypto.randomBytes(3).toString('hex').toUpperCase(); // Short 6-char hex IDs
+/* ───────────────── STATE ───────────────── */
+
+enum MomentReadiness { idle, waiting, alive }
+
+class MomentEngineState {
+  final MomentReadiness readiness;
+  final String? collapseReason;
+  const MomentEngineState(this.readiness, [this.collapseReason]);
 }
 
-function safeSend(ws, msg) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(msg));
-  }
-}
+/* ───────────────── PROVIDERS ───────────────── */
 
-function getPeer(ws) {
-  const s = sessions.get(ws.sessionId);
-  if (!s) return null;
-  return s.a === ws ? s.b : s.a;
-}
+final momentEngineProvider = StateNotifierProvider<MomentEngine, MomentEngineState>(
+  (ref) => MomentEngine(ref),
+);
 
-/* ───────────────── DASHBOARD UPDATES ───────────────── */
+// Provider for the Registry UI to listen to
+final dashboardProvider = StateProvider<List<PresenceAddress>>((ref) => []);
 
-/**
- * Sends a list of all addresses owned by a specific socket to that socket.
- */
-function sendDashboardUpdate(ws) {
-  const userAddresses = Array.from(addressRegistry.values())
-    .filter(addr => addr.creatorId === ws.id);
-  
-  safeSend(ws, { 
-    type: "dashboard_update", 
-    addresses: userAddresses 
-  });
-}
+final peerObstructionProvider = StateProvider<dynamic>((_) => null);
 
-/* ───────────────── COLLAPSE LOGIC ───────────────── */
+/* ───────────────── ENGINE ───────────────── */
 
-function hardCollapse(ws, reason) {
-  const addrId = ws.sessionId;
-  const s = sessions.get(addrId);
-  if (!s) return;
+class MomentEngine extends StateNotifier<MomentEngineState> with WidgetsBindingObserver {
+  final Ref ref;
 
-  log("COLLAPSE", addrId, reason);
-
-  // Clear server-side timers
-  if (s.obstructionTimer) clearTimeout(s.obstructionTimer);
-
-  const peer = getPeer(ws);
-  if (peer) {
-    safeSend(peer, { type: "collapse_hard", reason });
+  MomentEngine(this.ref) : super(const MomentEngineState(MomentReadiness.idle)) {
+    WidgetsBinding.instance.addObserver(this);
+    Future.microtask(_bindMediaBridge);
   }
 
-  // Handle Registry Policy
-  const entry = addressRegistry.get(addrId);
-  if (entry) {
-    if (reason === "session_completed_successfully") {
-      addressRegistry.delete(addrId); // Burn after successful use
-    } else if (!entry.keepAliveOnFailure) {
-      addressRegistry.delete(addrId); // Burn because it failed and keepAlive was false
-    } else {
-      entry.status = 'available'; // Preserve for another attempt
+  /* ───────────────── CALLBACKS ───────────────── */
+
+  void Function(String)? onRemoteText;
+  void Function(bool)? onRemoteHold;
+  void Function()? onRemoteClear;
+  void Function(Uint8List, int, int)? onRevealFrame;
+  void Function(int)? onPeerObstructed;
+  void Function()? onPeerRestored;
+
+  /* ───────────────── INTERNAL ───────────────── */
+
+  WebSocketChannel? _ws;
+  Timer? _heartbeat;
+  bool _collapsing = false;
+  bool _attentionExempted = false;
+
+  bool get attentionExempted => _attentionExempted;
+
+  /* ───────────────── MEDIA BRIDGE ───────────────── */
+
+  void _bindMediaBridge() {
+    ref.read(mediaSignalBridgeProvider.notifier).state = sendSignal;
+  }
+
+  /* ───────────────── REGISTRY & CONNECTION ───────────────── */
+
+  /// Call this when entering the PresenceSurface to ensure the socket is open
+  void initializeRegistry() {
+    if (_ws == null) {
+      momentLog("Initializing Registry Connection...");
+      _connectAndJoin({}); 
     }
   }
 
-  sessions.delete(addrId);
-  sendDashboardUpdate(ws);
-  if (peer) sendDashboardUpdate(peer);
-}
+  Future<void> _connectAndJoin(Map<String, dynamic> payload) async {
+    try {
+      _ws = WebSocketChannel.connect(
+        Uri.parse('wss://presence-media-server-production.up.railway.app/ws'),
+      );
 
-/* ───────────────── REGISTRY JANITOR ───────────────── */
+      _ws!.stream.listen(
+        _onMessage,
+        onDone: () => _collapseHard('socket_closed'),
+        onError: (e) => _collapseHard('socket_error'),
+        cancelOnError: true,
+      );
 
-// Clean up expired addresses once every minute
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, data] of addressRegistry.entries()) {
-    if (now > data.expiresAt && data.status !== 'active') {
-      addressRegistry.delete(id);
-      log("EXPIRED", id);
+      // If we have a payload (like an address to join), send it immediately
+      if (payload.isNotEmpty) {
+        sendSignal({'type': 'join', ...payload});
+      }
+
+      _heartbeat?.cancel();
+      _heartbeat = Timer.periodic(const Duration(seconds: 15), (_) {
+        sendSignal({'type': 'ping'});
+      });
+    } catch (e) {
+      momentLog("Connection error: $e");
     }
   }
-}, 60000);
 
-/* ───────────────── WEBSOCKET LOGIC ───────────────── */
+  /* ───────────────── PUBLIC API ───────────────── */
 
-const server = http.createServer((_, res) => res.end("Presence Server Online"));
-const wss = new WebSocketServer({ server, path: "/ws" });
+  void reservePresence({required String nickname, required int hours, required bool keepAlive}) {
+    momentLog("Requesting Reservation for $nickname");
+    sendSignal({
+      'type': 'reserve_address',
+      'nickname': nickname,
+      'expiryHours': hours,
+      'keepAliveOnFailure': keepAlive,
+    });
+  }
 
-wss.on("connection", (ws) => {
-  ws.id = crypto.randomUUID();
-  ws.isAlive = true;
-  log("NEW_CONNECTION", ws.id);
+  void deletePresence(String id) {
+    momentLog("Deleting address: $id");
+    sendSignal({'type': 'delete_address', 'addressId': id});
+  }
 
-  ws.on("pong", () => ws.isAlive = true);
+  Future<void> declarePresence(String address) async {
+    if (ref.read(presenceLockProvider)) return;
+    _reset();
+    state = const MomentEngineState(MomentReadiness.waiting);
+    await _connectAndJoin({'address': address});
+  }
 
-  ws.on("message", (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
+  void sendSignal(Map<String, dynamic> payload) {
+    if (_ws == null) {
+      momentLog("Cannot send signal: Socket is NULL. Reconnecting...");
+      _connectAndJoin({});
+      return;
+    }
+    _ws?.sink.add(jsonEncode(payload));
+  }
 
-    switch (msg.type) {
-      /* ── DASHBOARD: RESERVE ── */
-      case "reserve_address": {
-        const { expiryHours, keepAliveOnFailure, nickname } = msg;
-        const addressId = uid(); 
-        const expiresAt = Date.now() + (Math.max(1, Math.min(hours, 24)) * 3600000);
+  /* ───────────────── MESSAGE HANDLING ───────────────── */
 
-        addressRegistry.set(addressId, {
-          addressId,
-          creatorId: ws.id,
-          nickname: nickname || "Anonymous",
-          keepAliveOnFailure: !!keepAliveOnFailure,
-          expiresAt,
-          status: 'available'
-        });
+  Future<void> _onMessage(dynamic raw) async {
+    final msg = jsonDecode(raw as String) as Map<String, dynamic>;
+    momentLog("Inbound: ${msg['type']}");
 
-        log("RESERVED", addressId, `by ${ws.id}`);
-        sendDashboardUpdate(ws);
+    switch (msg['type']) {
+      case 'dashboard_update':
+        final List rawList = msg['addresses'] ?? [];
+        ref.read(dashboardProvider.notifier).state = 
+            rawList.map((j) => PresenceAddress.fromJson(j)).toList();
         break;
-      }
 
-      /* ── DASHBOARD: DELETE ── */
-      case "delete_address": {
-        const entry = addressRegistry.get(msg.addressId);
-        if (entry && entry.creatorId === ws.id) {
-          // If a session is currently active on this ID, kill it
-          if (entry.status === 'active') hardCollapse(ws, "owner_terminated");
-          addressRegistry.delete(msg.addressId);
-          sendDashboardUpdate(ws);
+      case 'ready':
+        ref.read(presenceLockProvider.notifier).state = true;
+        final initiator = msg['role'] == 'initiator';
+        ref.read(mediaEngineProvider.notifier).setPolite(!initiator);
+        await ref.read(mediaEngineProvider.notifier).warmUpMedia();
+        if (initiator) {
+          await ref.read(mediaEngineProvider.notifier).maybeMakeOffer();
         }
+        state = const MomentEngineState(MomentReadiness.alive);
         break;
-      }
 
-      /* ── CORE: JOIN ── */
-      case "join": {
-        const addrId = msg.address;
-        const entry = addressRegistry.get(addrId);
-
-        if (!entry || entry.status === 'consumed' || Date.now() > entry.expiresAt) {
-          return safeSend(ws, { type: "error", message: "Invalid or expired address" });
-        }
-
-        ws.sessionId = addrId;
-        let s = sessions.get(addrId);
-
-        if (!s) {
-          entry.status = 'active';
-          sessions.set(addrId, { a: ws, b: null });
-          log("SESSION_START", addrId);
-        } else if (!s.b) {
-          s.b = ws;
-          safeSend(s.a, { type: "ready", role: "initiator", peerNickname: entry.nickname });
-          safeSend(s.b, { type: "ready", role: "polite", peerNickname: entry.nickname });
-        }
+      case 'webrtc_offer':
+        await ref.read(mediaEngineProvider.notifier).handleRemoteOffer(msg);
         break;
-      }
 
-      /* ── WEBRTC / SIGNALING ── */
-      case "peer_obstructed":
-      case "peer_restored":
-      case "webrtc_offer":
-      case "webrtc_answer":
-      case "webrtc_ice": {
-        const peer = getPeer(ws);
-        if (peer) safeSend(peer, msg);
+      case 'webrtc_answer':
+        await ref.read(mediaEngineProvider.notifier).handleRemoteAnswer(msg);
         break;
-      }
 
-      case "collapse_user_intent":
-        hardCollapse(ws, "session_completed_successfully");
+      case 'webrtc_ice':
+        await ref.read(mediaEngineProvider.notifier).addIceCandidate(msg);
+        break;
+
+      case 'text':
+        onRemoteText?.call(msg['text'] ?? '');
+        break;
+
+      case 'reveal_frame':
+        onRevealFrame?.call(base64Decode(msg['bytes']), msg['w'], msg['h']);
+        break;
+
+      case 'collapse':
+        _collapseHard(msg['reason'] ?? 'remote_end');
         break;
     }
-  });
+  }
 
-  ws.on("close", () => {
-    if (ws.sessionId) hardCollapse(ws, "socket_lost");
-    log("WS_DISCONNECT", ws.id);
-  });
-});
+  /* ───────────────── LIFECYCLE ───────────────── */
 
-/* ───────────────── HEARTBEAT ───────────────── */
+  void collapseImmediatelyByUser() => _collapseHard('user_terminated');
 
-setInterval(() => {
-  wss.clients.forEach((ws) => {
-    if (!ws.isAlive) return ws.terminate();
-    ws.isAlive = false;
-    ws.ping();
-  });
-}, HEARTBEAT_INTERVAL);
+  void _collapseHard(String reason) {
+    if (_collapsing) return;
+    _collapsing = true;
+    _heartbeat?.cancel();
+    ref.read(mediaEngineProvider.notifier).disposeMedia();
+    _ws?.sink.close();
+    _ws = null;
+    ref.read(presenceLockProvider.notifier).state = false;
+    state = MomentEngineState(MomentReadiness.idle, reason);
+  }
 
-server.listen(PORT, "0.0.0.0", () => log("SERVER_RUNNING", PORT));
+  void _reset() {
+    _collapsing = false;
+    _heartbeat?.cancel();
+    _ws?.sink.close();
+    _ws = null;
+    ref.read(mediaEngineProvider.notifier).disposeMedia();
+    ref.read(presenceLockProvider.notifier).state = false;
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _reset();
+    super.dispose();
+  }
+}
