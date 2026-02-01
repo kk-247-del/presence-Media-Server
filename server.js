@@ -1,6 +1,6 @@
 /**
- * Presence Media / Signaling Server
- * AUTHORITATIVE – deterministic obstruction + collapse
+ * Presence Media / Signaling Server (Authoritative Registry)
+ * Features: Identity, TTL Expiry, Dashboard Management, and One-Time Use Logic.
  */
 
 import http from "http";
@@ -9,26 +9,27 @@ import crypto from "crypto";
 
 const PORT = process.env.PORT || 8080;
 const HEARTBEAT_INTERVAL = 20000;
-const COLLAPSE_GRACE_SECONDS = 10;
 
 /**
- * sessionId → {
- *   a: WebSocket | null,
- *   b: WebSocket | null,
- *   obstructionActive: boolean,
- *   obstructionTimer: Timeout | null
+ * addressRegistry: addressId -> { 
+ * addressId, creatorId, nickname, keepAliveOnFailure, expiresAt, status 
  * }
+ */
+const addressRegistry = new Map();
+
+/**
+ * sessions: addressId -> { a: WebSocket, b: WebSocket, obstructionTimer }
  */
 const sessions = new Map();
 
 /* ───────────────── UTILS ───────────────── */
 
 function log(...args) {
-  console.log(new Date().toISOString(), ...args);
+  console.log(`[${new Date().toISOString()}]`, ...args);
 }
 
 function uid() {
-  return crypto.randomUUID();
+  return crypto.randomBytes(3).toString('hex').toUpperCase(); // Short 6-char hex IDs
 }
 
 function safeSend(ws, msg) {
@@ -37,195 +38,167 @@ function safeSend(ws, msg) {
   }
 }
 
-function getSession(ws) {
-  return ws.sessionId ? sessions.get(ws.sessionId) ?? null : null;
-}
-
 function getPeer(ws) {
-  const s = getSession(ws);
+  const s = sessions.get(ws.sessionId);
   if (!s) return null;
   return s.a === ws ? s.b : s.a;
 }
 
-/* ───────────────── SOFT OBSTRUCTION (FIXED) ───────────────── */
+/* ───────────────── DASHBOARD UPDATES ───────────────── */
 
-function startObstruction(actor, reason) {
-  const s = getSession(actor);
-  if (!s) return;
-
-  // 🔒 HARD GUARD — already obstructed
-  if (s.obstructionActive) return;
-
-  const peer = getPeer(actor);
-  if (!peer) return;
-
-  s.obstructionActive = true;
-
-  log("PEER_OBSTRUCTED", peer.id, reason);
-
-  safeSend(peer, {
-    type: "peer_obstructed",
-    seconds: COLLAPSE_GRACE_SECONDS,
-    reason,
+/**
+ * Sends a list of all addresses owned by a specific socket to that socket.
+ */
+function sendDashboardUpdate(ws) {
+  const userAddresses = Array.from(addressRegistry.values())
+    .filter(addr => addr.creatorId === ws.id);
+  
+  safeSend(ws, { 
+    type: "dashboard_update", 
+    addresses: userAddresses 
   });
-
-  s.obstructionTimer = setTimeout(() => {
-    if (!s.obstructionActive) return;
-
-    log("GRACE_EXPIRED", actor.sessionId);
-
-    safeSend(peer, {
-      type: "collapse_grace_elapsed",
-      reason: "grace_elapsed",
-    });
-
-    hardCollapse(actor, "grace_elapsed");
-  }, COLLAPSE_GRACE_SECONDS * 1000);
 }
 
-function cancelObstruction(actor) {
-  const s = getSession(actor);
-  if (!s) return;
-
-  if (!s.obstructionActive) return;
-
-  s.obstructionActive = false;
-
-  if (s.obstructionTimer) {
-    clearTimeout(s.obstructionTimer);
-    s.obstructionTimer = null;
-  }
-
-  const peer = getPeer(actor);
-  if (peer) {
-    safeSend(peer, { type: "peer_restored" });
-  }
-
-  log("PEER_RESTORED", actor.id);
-}
-
-/* ───────────────── HARD COLLAPSE ───────────────── */
+/* ───────────────── COLLAPSE LOGIC ───────────────── */
 
 function hardCollapse(ws, reason) {
-  const s = getSession(ws);
+  const addrId = ws.sessionId;
+  const s = sessions.get(addrId);
   if (!s) return;
 
-  if (s.obstructionTimer) {
-    clearTimeout(s.obstructionTimer);
-    s.obstructionTimer = null;
-  }
+  log("COLLAPSE", addrId, reason);
 
-  s.obstructionActive = false;
+  // Clear server-side timers
+  if (s.obstructionTimer) clearTimeout(s.obstructionTimer);
 
   const peer = getPeer(ws);
   if (peer) {
-    safeSend(peer, {
-      type: "collapse_hard",
-      reason,
-    });
+    safeSend(peer, { type: "collapse_hard", reason });
   }
 
-  cleanup(ws);
-}
-
-/* ───────────────── CLEANUP ───────────────── */
-
-function cleanup(ws) {
-  const s = getSession(ws);
-  if (!s) return;
-
-  cancelObstruction(ws);
-
-  if (s.a === ws) s.a = null;
-  if (s.b === ws) s.b = null;
-
-  if (!s.a && !s.b) {
-    sessions.delete(ws.sessionId);
-    log("SESSION_REMOVED", ws.sessionId);
+  // Handle Registry Policy
+  const entry = addressRegistry.get(addrId);
+  if (entry) {
+    if (reason === "session_completed_successfully") {
+      addressRegistry.delete(addrId); // Burn after successful use
+    } else if (!entry.keepAliveOnFailure) {
+      addressRegistry.delete(addrId); // Burn because it failed and keepAlive was false
+    } else {
+      entry.status = 'available'; // Preserve for another attempt
+    }
   }
+
+  sessions.delete(addrId);
+  sendDashboardUpdate(ws);
+  if (peer) sendDashboardUpdate(peer);
 }
 
-/* ───────────────── HTTP ───────────────── */
+/* ───────────────── REGISTRY JANITOR ───────────────── */
 
-const server = http.createServer((_, res) => {
-  res.end("Presence signaling server alive");
-});
+// Clean up expired addresses once every minute
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, data] of addressRegistry.entries()) {
+    if (now > data.expiresAt && data.status !== 'active') {
+      addressRegistry.delete(id);
+      log("EXPIRED", id);
+    }
+  }
+}, 60000);
 
-/* ───────────────── WEBSOCKET ───────────────── */
+/* ───────────────── WEBSOCKET LOGIC ───────────────── */
 
+const server = http.createServer((_, res) => res.end("Presence Server Online"));
 const wss = new WebSocketServer({ server, path: "/ws" });
 
 wss.on("connection", (ws) => {
-  ws.id = uid();
-  ws.sessionId = null;
+  ws.id = crypto.randomUUID();
   ws.isAlive = true;
+  log("NEW_CONNECTION", ws.id);
 
-  log("WS_CONNECT", ws.id);
-
-  ws.on("pong", () => {
-    ws.isAlive = true;
-  });
+  ws.on("pong", () => ws.isAlive = true);
 
   ws.on("message", (raw) => {
     let msg;
-    try {
-      msg = JSON.parse(raw.toString());
-    } catch {
-      return;
-    }
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
 
     switch (msg.type) {
+      /* ── DASHBOARD: RESERVE ── */
+      case "reserve_address": {
+        const { expiryHours, keepAliveOnFailure, nickname } = msg;
+        const addressId = uid(); 
+        const expiresAt = Date.now() + (Math.max(1, Math.min(hours, 24)) * 3600000);
+
+        addressRegistry.set(addressId, {
+          addressId,
+          creatorId: ws.id,
+          nickname: nickname || "Anonymous",
+          keepAliveOnFailure: !!keepAliveOnFailure,
+          expiresAt,
+          status: 'available'
+        });
+
+        log("RESERVED", addressId, `by ${ws.id}`);
+        sendDashboardUpdate(ws);
+        break;
+      }
+
+      /* ── DASHBOARD: DELETE ── */
+      case "delete_address": {
+        const entry = addressRegistry.get(msg.addressId);
+        if (entry && entry.creatorId === ws.id) {
+          // If a session is currently active on this ID, kill it
+          if (entry.status === 'active') hardCollapse(ws, "owner_terminated");
+          addressRegistry.delete(msg.addressId);
+          sendDashboardUpdate(ws);
+        }
+        break;
+      }
+
+      /* ── CORE: JOIN ── */
       case "join": {
-        const sessionId = msg.address || msg.linkToken;
-        if (!sessionId) return;
+        const addrId = msg.address;
+        const entry = addressRegistry.get(addrId);
 
-        ws.sessionId = sessionId;
+        if (!entry || entry.status === 'consumed' || Date.now() > entry.expiresAt) {
+          return safeSend(ws, { type: "error", message: "Invalid or expired address" });
+        }
 
-        let s = sessions.get(sessionId);
+        ws.sessionId = addrId;
+        let s = sessions.get(addrId);
+
         if (!s) {
-          s = {
-            a: ws,
-            b: null,
-            obstructionActive: false,
-            obstructionTimer: null,
-          };
-          sessions.set(sessionId, s);
-          return;
-        }
-
-        if (!s.b) {
+          entry.status = 'active';
+          sessions.set(addrId, { a: ws, b: null });
+          log("SESSION_START", addrId);
+        } else if (!s.b) {
           s.b = ws;
-          safeSend(s.a, { type: "ready", role: "initiator" });
-          safeSend(s.b, { type: "ready", role: "polite" });
+          safeSend(s.a, { type: "ready", role: "initiator", peerNickname: entry.nickname });
+          safeSend(s.b, { type: "ready", role: "polite", peerNickname: entry.nickname });
         }
         break;
       }
 
-      case "peer_obstructed": {
-        startObstruction(ws, msg.reason ?? "peer_obstructed");
-        break;
-      }
-
-      case "peer_restored": {
-        cancelObstruction(ws);
-        break;
-      }
-
-      case "collapse_hard": {
-        hardCollapse(ws, msg.reason ?? "hard_violation");
-        break;
-      }
-
-      default: {
+      /* ── WEBRTC / SIGNALING ── */
+      case "peer_obstructed":
+      case "peer_restored":
+      case "webrtc_offer":
+      case "webrtc_answer":
+      case "webrtc_ice": {
         const peer = getPeer(ws);
         if (peer) safeSend(peer, msg);
+        break;
       }
+
+      case "collapse_user_intent":
+        hardCollapse(ws, "session_completed_successfully");
+        break;
     }
   });
 
   ws.on("close", () => {
-    log("WS_CLOSE", ws.id);
-    hardCollapse(ws, "socket_closed");
+    if (ws.sessionId) hardCollapse(ws, "socket_lost");
+    log("WS_DISCONNECT", ws.id);
   });
 });
 
@@ -233,20 +206,10 @@ wss.on("connection", (ws) => {
 
 setInterval(() => {
   wss.clients.forEach((ws) => {
-    if (!ws.isAlive) {
-      log("WS_TIMEOUT", ws.id);
-      hardCollapse(ws, "heartbeat_timeout");
-      ws.terminate();
-      return;
-    }
-
+    if (!ws.isAlive) return ws.terminate();
     ws.isAlive = false;
     ws.ping();
   });
 }, HEARTBEAT_INTERVAL);
 
-/* ───────────────── START ───────────────── */
-
-server.listen(PORT, "0.0.0.0", () => {
-  log("SERVER_STARTED", PORT);
-});
+server.listen(PORT, "0.0.0.0", () => log("SERVER_RUNNING", PORT));
