@@ -1,10 +1,10 @@
-const http = require('http');
-const WebSocket = require('ws');
-const { v4: uuidv4 } = require('uuid');
+import http from 'http';
+import { WebSocketServer, WebSocket } from 'ws';
+import { v4 as uuidv4 } from 'uuid';
 
-/** * 1. SERVER SETUP
- * Railway assigns a dynamic port via process.env.PORT. 
- * We must listen on 0.0.0.0 to be reachable.
+/**
+ * 1. SERVER SETUP
+ * Railway assigns a dynamic port via process.env.PORT.
  */
 const PORT = process.env.PORT || 8080;
 const server = http.createServer((req, res) => {
@@ -12,12 +12,10 @@ const server = http.createServer((req, res) => {
   res.end("Presence Media Server is Running");
 });
 
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocketServer({ server });
 
 /**
  * 2. REGISTRY STATE
- * In-memory storage for presence addresses.
- * Note: In production, you'd eventually move this to Redis or PostgreSQL.
  */
 let registry = [];
 
@@ -56,12 +54,11 @@ wss.on('connection', (ws) => {
           break;
 
         case 'join':
-          // Arming logic: Find the address and notify the client
           const target = registry.find(r => r.address === msg.address);
           if (target) {
             ws.send(JSON.stringify({
               type: 'ready',
-              role: 'initiator', // First joiner becomes initiator for WebRTC
+              role: 'initiator',
               peerNickname: target.nickname
             }));
           } else {
@@ -74,7 +71,6 @@ wss.on('connection', (ws) => {
           break;
 
         default:
-          // Relay WebRTC signals (offers, answers, ice) to other clients
           broadcastToOthers(ws, msg);
           break;
       }
@@ -86,7 +82,8 @@ wss.on('connection', (ws) => {
   ws.on('close', () => console.log('🔌 Peer Disconnected'));
 });
 
-/** * 3. HELPER FUNCTIONS
+/**
+ * 3. HELPER FUNCTIONS
  */
 
 function sendDashboardUpdate(ws) {
