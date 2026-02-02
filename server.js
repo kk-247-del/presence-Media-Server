@@ -1,123 +1,118 @@
- import http from 'http';
+import http from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
-import { v4 as uuidv4 } from 'uuid';
 
 const PORT = process.env.PORT || 8080;
+
+// LAW: Minimal Coordination Backend. No Storage.
 const server = http.createServer((req, res) => {
   res.writeHead(200);
-  res.end("Presence Media Server Active");
+  res.end("Locus Class Coordination Active");
 });
 
 const wss = new WebSocketServer({ server });
 
-// In-memory registry
-let registry = [];
+wss.on('connection', (ws, req) => {
+  // Extract the Window ID from the URL: wss://domain.com/v1/KAB123
+  const driftWindowId = req.url.split('/').pop()?.toUpperCase();
 
-wss.on('connection', (ws) => {
-  console.log('📦 Peer Connected');
+  if (!driftWindowId || driftWindowId.length < 3) {
+    ws.close(1008, "Invalid Drift Window");
+    return;
+  }
+
+  ws.driftId = driftWindowId;
+  ws.isAlive = true;
+
+  console.log(`📡 Window ${driftWindowId}: Peer Entered`);
 
   ws.on('message', (rawData) => {
     try {
       const msg = JSON.parse(rawData);
 
       switch (msg.type) {
-        case 'handshake':
-        case 'get_dashboard':
-          sendDashboardUpdate(ws);
+        // LAW #1: Presence Heartbeats. Continually evaluated.
+        case 'heartbeat':
+          ws.isAlive = true;
+          ws.foreground = msg.foreground;
+          evaluatePresence(driftWindowId);
           break;
 
-        case 'reserve_address':
-          const newId = uuidv4().substring(0, 8).toUpperCase();
-          const entry = {
-            id: newId,
-            address: newId,
-            nickname: msg.nickname || 'Anonymous',
-            expiry: `${msg.expiryHours || 24}h`,
-            expiresAt: Date.now() + (msg.expiryHours || 24) * 3600000
-          };
-          registry.push(entry);
-          broadcastDashboard();
-          break;
-
-        case 'delete_address':
-          registry = registry.filter(item => item.id !== msg.addressId);
-          broadcastDashboard();
-          break;
-
-        case 'join':
-          // Identify this socket with the address they are "Arming"
-          ws.presenceAddress = msg.address;
-          
-          // Find if there is someone else already at this address
-          const peers = Array.from(wss.clients).filter(
-            client => client !== ws && client.presenceAddress === msg.address
-          );
-
-          if (peers.length > 0) {
-            // Pair found!
-            const peer = peers[0];
-            ws.send(JSON.stringify({ type: 'ready', role: 'joiner' }));
-            peer.send(JSON.stringify({ type: 'ready', role: 'initiator' }));
-          } else {
-            // Wait for a peer...
-            console.log(`Waiting for peer on: ${msg.address}`);
-          }
-          break;
-
-        case 'ping':
-          ws.send(JSON.stringify({ type: 'pong' }));
-          break;
-
-        // 🛰️ WebRTC Signaling Relay
-        // Forwards offer/answer/ice to the other person on the same address
+        // LAW #2: No "Send". These are real-time expressions being relayed.
+        case 'text':
+        case 'hold':
+        case 'clear':
         case 'webrtc_offer':
         case 'webrtc_answer':
         case 'webrtc_ice':
-        case 'text':
         case 'reveal_frame':
+        case 'obstruction':
+        case 'restored':
           relayToPeer(ws, msg);
           break;
       }
     } catch (e) {
-      console.error("Signal Error:", e);
+      console.error("Signal Logic Error:", e);
     }
   });
 
-  ws.on('close', () => console.log('🔌 Peer Disconnected'));
+  ws.on('close', () => {
+    console.log(`🔌 Window ${driftWindowId}: Peer Left`);
+    notifyCollapse(driftWindowId);
+  });
 });
 
 /**
- * RELAY LOGIC: Finds the other person at the same address and sends them the data
+ * LAW #1 & #5: Evaluates if both participants are foregrounded.
+ * If conditions fail, it triggers a presence_update to collapse the moment.
+ */
+function evaluatePresence(windowId) {
+  const peers = Array.from(wss.clients).filter(c => c.driftId === windowId);
+  
+  const presenceUpdate = JSON.stringify({
+    type: 'presence_update',
+    isPresent: peers.length >= 2 && peers.every(p => p.foreground === true)
+  });
+
+  peers.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(presenceUpdate);
+    }
+  });
+}
+
+/**
+ * RELAY LOGIC: Stateless forwarding.
  */
 function relayToPeer(sender, msg) {
   wss.clients.forEach(client => {
     if (client !== sender && 
         client.readyState === WebSocket.OPEN && 
-        client.presenceAddress === sender.presenceAddress) {
+        client.driftId === sender.driftId) {
       client.send(JSON.stringify(msg));
     }
   });
 }
 
-function sendDashboardUpdate(ws) {
-  ws.send(JSON.stringify({ type: 'dashboard_update', addresses: registry }));
-}
-
-function broadcastDashboard() {
-  const data = JSON.stringify({ type: 'dashboard_update', addresses: registry });
+function notifyCollapse(windowId) {
+  const data = JSON.stringify({ type: 'presence_update', isPresent: false });
   wss.clients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) client.send(data);
+    if (client.driftId === windowId && client.readyState === WebSocket.OPEN) {
+      client.send(data);
+    }
   });
 }
 
-// 🧹 Clean expired addresses every 5 minutes
-setInterval(() => {
-  const now = Date.now();
-  const initialLength = registry.length;
-  registry = registry.filter(item => item.expiresAt > now);
-  if (registry.length !== initialLength) broadcastDashboard();
-}, 300000);
+// 🛡️ LAW #5: Dead-Man Switch
+// Every 5 seconds, ensure peers are actually there.
+const interval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) return ws.terminate();
+    ws.isAlive = false; // Reset, waiting for next heartbeat
+  });
+}, 5000);
+
+wss.on('close', () => clearInterval(interval));
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Server listening on port ${PORT}`);
+  console.log(`🚀 Locus Server listening on port ${PORT}`);
 });
