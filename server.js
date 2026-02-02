@@ -1,122 +1,123 @@
-import http from "http";
-import { WebSocketServer, WebSocket } from "ws";
+const WebSocket = require('ws');
+const http = require('http');
 
 const PORT = process.env.PORT || 8080;
-const HEARTBEAT_INTERVAL = 30000;
+const server = http.createServer();
+const wss = new WebSocket.Server({ server });
 
-// Memory stores
-const sessions = new Map(); // sessionId → { a: WebSocket, b: WebSocket }
-const registry = new Map(); // address → { name, socket }
+/**
+ * GLOBAL REGISTRY
+ * Maps Locus ID (e.g., "HAC295") -> WebSocket Instance
+ */
+const registry = new Map();
 
-const log = (...args) => console.log(new Date().toISOString(), ...args);
+/**
+ * PERSISTENT STORE (In-Memory for this example)
+ * In production, replace this with a MongoDB/PostgreSQL query.
+ */
+const mintedAddresses = new Set(["GER988", "PEL221"]); // Pre-seeded examples
 
-function safeSend(ws, msg) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(msg));
-  }
-}
+wss.on('connection', (ws, req) => {
+    // Extract Locus ID from the WebSocket Protocol header
+    const address = req.headers['sec-websocket-protocol']?.toUpperCase();
 
-const getPeer = (ws) => {
-  const s = sessions.get(ws.sessionId);
-  if (!s) return null;
-  return s.a === ws ? s.b : s.a;
-};
+    if (!address) {
+        console.log("❌ Rejected: No Locus Identity provided.");
+        ws.close();
+        return;
+    }
 
-function hardCollapse(ws, reason) {
-  const s = sessions.get(ws.sessionId);
-  if (!s) return;
-  const peer = getPeer(ws);
-  if (peer) {
-    log(`[${ws.sessionId}] Terminating peer: ${reason}`);
-    safeSend(peer, { type: "presence_update", isPresent: false, reason });
-    peer.terminate();
-  }
-  sessions.delete(ws.sessionId);
-  registry.delete(ws.sessionId);
-  ws.terminate();
-  log(`[${ws.sessionId}] Room collapsed.`);
-}
+    // Register the session
+    registry.set(address, ws);
+    mintedAddresses.add(address); // Remember this address permanently
+    console.log(`🌍 [REGISTERED] ${address} is now online.`);
 
-const server = http.createServer((req, res) => {
-  res.writeHead(200);
-  res.end("Locus Control Plane: Harmonized");
+    ws.on('message', (message) => {
+        try {
+            const data = JSON.parse(message);
+            console.log(`📩 [SIGNAL] from ${address}:`, data.type);
+
+            switch (data.type) {
+                case 'lookup_address':
+                    _handleLookup(ws, data.address);
+                    break;
+
+                case 'send_proposal':
+                    _handleProposal(address, data);
+                    break;
+
+                case 'respond_to_proposal':
+                    _handleResponse(address, data);
+                    break;
+
+                default:
+                    // Broadcast live signals (Text, Reveal, WebRTC) to the target peer
+                    _relaySignal(address, data);
+                    break;
+            }
+        } catch (e) {
+            console.error("⚠️ Message Error:", e);
+        }
+    });
+
+    ws.on('close', () => {
+        registry.delete(address);
+        console.log(`🌑 [OFFLINE] ${address} disconnected.`);
+    });
 });
 
-const wss = new WebSocketServer({ server });
+/* ── HELPER LOGIC ── */
 
-wss.on("connection", (ws, req) => {
-  ws.isAlive = true;
-  // Use sub-protocol header as the Address (Contract: HAC295)
-  ws.sessionId = req.headers['sec-websocket-protocol']?.toUpperCase() || "LOBBY";
+function _handleLookup(ws, targetAddress) {
+    const isOnline = registry.has(targetAddress);
+    const isMinted = mintedAddresses.has(targetAddress);
 
-  // Register user for lookup/knocking
-  registry.set(ws.sessionId, { socket: ws, name: "GUEST" });
+    ws.send(JSON.stringify({
+        type: 'lookup_response',
+        address: targetAddress,
+        found: isMinted, // True if the address exists in our memory
+        status: isOnline ? 'online' : 'offline',
+        name: isOnline ? "ACTIVE_PEER" : "REMEMBERED_ENTITY"
+    }));
+}
 
-  let s = sessions.get(ws.sessionId);
-  if (!s) {
-    s = { a: ws, b: null };
-    sessions.set(ws.sessionId, s);
-    log(`[${ws.sessionId}] Locus Active. Waiting for Peer B...`);
-  } else if (!s.b) {
-    s.b = ws;
-    log(`[${ws.sessionId}] Peer B matched. Bridging pathway.`);
-    safeSend(s.a, { type: "presence_update", isPresent: true, role: "initiator" });
-    safeSend(s.b, { type: "presence_update", isPresent: true, role: "polite" });
-  }
-
-  ws.on("message", (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw); } catch { return; }
-
-    // --- FEATURE: LOOKUP ---
-    if (msg.type === "lookup_address") {
-      const target = registry.get(msg.address?.toUpperCase());
-      safeSend(ws, { 
-        type: "lookup_response", 
-        found: !!target, 
-        name: target ? target.name : null 
-      });
-      return;
+function _handleProposal(fromAddress, data) {
+    const targetWs = registry.get(data.toAddress.toUpperCase());
+    
+    if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+        targetWs.send(JSON.stringify({
+            type: 'incoming_proposal',
+            id: `KNK-${Date.now()}`,
+            fromAddress: fromAddress,
+            fromName: data.fromName || "GUEST",
+            proposedTime: data.proposedTime
+        }));
+        console.log(`✨ [KNOCK] Forwarded from ${fromAddress} to ${data.toAddress}`);
+    } else {
+        console.log(`📭 [MISSED] ${data.toAddress} is offline. Proposal logged.`);
+        // Here you would typically save to a 'PendingProposals' DB table
     }
+}
 
-    // --- FEATURE: KNOCKING ---
-    if (msg.type === "send_proposal") {
-      const target = registry.get(msg.toAddress?.toUpperCase());
-      if (target) {
-        safeSend(target.socket, {
-          type: "incoming_proposal",
-          fromName: msg.fromName,
-          fromAddress: msg.fromAddress,
-          proposedTime: msg.proposedTime
-        });
-      }
-      return;
+function _handleResponse(fromAddress, data) {
+    // Relays accept/decline back to the proposer
+    _relaySignal(fromAddress, data);
+}
+
+function _relaySignal(senderAddress, data) {
+    // This logic assumes the 'data' packet contains a 'to' or 'target' field
+    const targetId = data.toAddress || data.target || data.to;
+    if (!targetId) return;
+
+    const targetWs = registry.get(targetId.toUpperCase());
+    if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+        targetWs.send(JSON.stringify({
+            ...data,
+            from: senderAddress
+        }));
     }
+}
 
-    if (msg.type === "heartbeat") {
-      ws.isAlive = true;
-      if (msg.foreground === false) hardCollapse(ws, "peer_backgrounded");
-      return;
-    }
-
-    // Official Passthrough for Live Signals (Text, Reveal, SDP)
-    const peer = getPeer(ws);
-    if (peer) peer.send(raw.toString());
-  });
-
-  ws.on("close", () => {
-    registry.delete(ws.sessionId);
-    hardCollapse(ws, "socket_closed");
-  });
-  ws.on("pong", () => (ws.isAlive = true));
+server.listen(PORT, () => {
+    console.log(`🚀 Presence Signal Plane active on port ${PORT}`);
 });
-
-setInterval(() => {
-  wss.clients.forEach((ws) => {
-    if (!ws.isAlive) return ws.terminate();
-    ws.isAlive = false;
-    ws.ping();
-  });
-}, HEARTBEAT_INTERVAL);
-
-server.listen(PORT, "0.0.0.0", () => log(`🚀 Server listening on ${PORT}`));
