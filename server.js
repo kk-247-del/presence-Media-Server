@@ -1,14 +1,15 @@
-const WebSocket = require('ws');
-const http = require('http');
+import { WebSocketServer, WebSocket } from 'ws';
+import { createServer } from 'http';
 
-// Railway/Heroku dynamic port binding
+// Railway dynamic port binding
 const PORT = process.env.PORT || 8080;
-const server = http.createServer((req, res) => {
+
+const server = createServer((req, res) => {
     res.writeHead(200);
-    res.end("Presence Signal Plane is Active\n");
+    res.end("Presence Signal Plane is Active (ESM)\n");
 });
 
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocketServer({ server });
 
 /**
  * REGISTRY & PERSISTENCE
@@ -16,11 +17,10 @@ const wss = new WebSocket.Server({ server });
  * mintedStore: every address ever generated (The Memory)
  */
 const registry = new Map();
-const mintedStore = new Set(); 
+const mintedStore = new Set();
 
 wss.on('connection', (ws, req) => {
     // 1. EXTRACT IDENTITY
-    // We trim to handle potential whitespace/formatting from different clients
     const protocol = req.headers['sec-websocket-protocol'];
     const address = protocol ? protocol.split(',')[0].trim().toUpperCase() : null;
 
@@ -32,11 +32,11 @@ wss.on('connection', (ws, req) => {
 
     // 2. REGISTER & PERSIST
     registry.set(address, ws);
-    mintedStore.add(address); // This ensures the server "remembers" the address
+    mintedStore.add(address); 
     
     console.log(`🌍 [MINTED/ONLINE] Identity: ${address}`);
 
-    // 3. SEND WELCOME / SYNC
+    // 3. SEND WELCOME SYNC
     ws.send(JSON.stringify({
         type: 'sync_success',
         identity: address,
@@ -68,7 +68,6 @@ wss.on('connection', (ws, req) => {
                     break;
 
                 default:
-                    // Relays WebRTC, Live Text, and Reveal signals
                     _relayToTarget(address, data.to || data.target, data);
                     break;
             }
@@ -90,6 +89,7 @@ wss.on('connection', (ws, req) => {
 /* ── HELPERS ── */
 
 function _handleLookup(ws, targetAddress) {
+    if (!targetAddress) return;
     const target = targetAddress.toUpperCase();
     const isMinted = mintedStore.has(target);
     const isOnline = registry.has(target);
@@ -97,9 +97,9 @@ function _handleLookup(ws, targetAddress) {
     ws.send(JSON.stringify({
         type: 'lookup_response',
         address: target,
-        found: isMinted, // The "Memory" check
+        found: isMinted, 
         status: isOnline ? 'online' : 'offline',
-        name: isOnline ? "ACTIVE_ENTITY" : "IDLE_ENTITY"
+        name: isOnline ? "ACTIVE_PEER" : "OFFLINE_PEER"
     }));
 }
 
@@ -117,8 +117,7 @@ function _relayToTarget(fromAddress, toAddress, payload) {
     }
 }
 
-// CRITICAL: Railway requires the server to bind to 0.0.0.0
+// Bind to 0.0.0.0 for cloud routing
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Presence Plane Online | Port: ${PORT}`);
-    console.log(`🔒 Persistence Engine Active`);
+    console.log(`🚀 Presence Plane Online (ESM) | Port: ${PORT}`);
 });
