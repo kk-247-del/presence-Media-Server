@@ -1,41 +1,53 @@
 const WebSocket = require('ws');
 const http = require('http');
 
+// Railway/Heroku dynamic port binding
 const PORT = process.env.PORT || 8080;
-const server = http.createServer();
+const server = http.createServer((req, res) => {
+    res.writeHead(200);
+    res.end("Presence Signal Plane is Active\n");
+});
+
 const wss = new WebSocket.Server({ server });
 
 /**
- * GLOBAL REGISTRY
- * Maps Locus ID (e.g., "HAC295") -> WebSocket Instance
+ * REGISTRY & PERSISTENCE
+ * registry: active socket connections
+ * mintedStore: every address ever generated (The Memory)
  */
 const registry = new Map();
-
-/**
- * PERSISTENT STORE (In-Memory for this example)
- * In production, replace this with a MongoDB/PostgreSQL query.
- */
-const mintedAddresses = new Set(["GER988", "PEL221"]); // Pre-seeded examples
+const mintedStore = new Set(); 
 
 wss.on('connection', (ws, req) => {
-    // Extract Locus ID from the WebSocket Protocol header
-    const address = req.headers['sec-websocket-protocol']?.toUpperCase();
+    // 1. EXTRACT IDENTITY
+    // We trim to handle potential whitespace/formatting from different clients
+    const protocol = req.headers['sec-websocket-protocol'];
+    const address = protocol ? protocol.split(',')[0].trim().toUpperCase() : null;
 
     if (!address) {
-        console.log("❌ Rejected: No Locus Identity provided.");
-        ws.close();
+        console.log("❌ REJECTED: Connection attempt without Locus ID.");
+        ws.terminate();
         return;
     }
 
-    // Register the session
+    // 2. REGISTER & PERSIST
     registry.set(address, ws);
-    mintedAddresses.add(address); // Remember this address permanently
-    console.log(`🌍 [REGISTERED] ${address} is now online.`);
+    mintedStore.add(address); // This ensures the server "remembers" the address
+    
+    console.log(`🌍 [MINTED/ONLINE] Identity: ${address}`);
 
+    // 3. SEND WELCOME / SYNC
+    ws.send(JSON.stringify({
+        type: 'sync_success',
+        identity: address,
+        timestamp: new Date().toISOString()
+    }));
+
+    // 4. MESSAGE ROUTING
     ws.on('message', (message) => {
         try {
             const data = JSON.parse(message);
-            console.log(`📩 [SIGNAL] from ${address}:`, data.type);
+            console.log(`📩 [${address}] -> ${data.type}`);
 
             switch (data.type) {
                 case 'lookup_address':
@@ -43,81 +55,70 @@ wss.on('connection', (ws, req) => {
                     break;
 
                 case 'send_proposal':
-                    _handleProposal(address, data);
+                    _relayToTarget(address, data.toAddress, {
+                        type: 'incoming_proposal',
+                        fromAddress: address,
+                        fromName: data.fromName,
+                        proposedTime: data.proposedTime
+                    });
                     break;
 
                 case 'respond_to_proposal':
-                    _handleResponse(address, data);
+                    _relayToTarget(address, data.to, data);
                     break;
 
                 default:
-                    // Broadcast live signals (Text, Reveal, WebRTC) to the target peer
-                    _relaySignal(address, data);
+                    // Relays WebRTC, Live Text, and Reveal signals
+                    _relayToTarget(address, data.to || data.target, data);
                     break;
             }
         } catch (e) {
-            console.error("⚠️ Message Error:", e);
+            console.error("⚠️ Signal Error:", e);
         }
     });
 
     ws.on('close', () => {
         registry.delete(address);
-        console.log(`🌑 [OFFLINE] ${address} disconnected.`);
+        console.log(`🌑 [OFFLINE] ${address}`);
+    });
+
+    ws.on('error', (err) => {
+        console.error(`🚨 Socket Error for ${address}:`, err);
     });
 });
 
-/* ── HELPER LOGIC ── */
+/* ── HELPERS ── */
 
 function _handleLookup(ws, targetAddress) {
-    const isOnline = registry.has(targetAddress);
-    const isMinted = mintedAddresses.has(targetAddress);
+    const target = targetAddress.toUpperCase();
+    const isMinted = mintedStore.has(target);
+    const isOnline = registry.has(target);
 
     ws.send(JSON.stringify({
         type: 'lookup_response',
-        address: targetAddress,
-        found: isMinted, // True if the address exists in our memory
+        address: target,
+        found: isMinted, // The "Memory" check
         status: isOnline ? 'online' : 'offline',
-        name: isOnline ? "ACTIVE_PEER" : "REMEMBERED_ENTITY"
+        name: isOnline ? "ACTIVE_ENTITY" : "IDLE_ENTITY"
     }));
 }
 
-function _handleProposal(fromAddress, data) {
-    const targetWs = registry.get(data.toAddress.toUpperCase());
-    
+function _relayToTarget(fromAddress, toAddress, payload) {
+    if (!toAddress) return;
+    const targetWs = registry.get(toAddress.toUpperCase());
+
     if (targetWs && targetWs.readyState === WebSocket.OPEN) {
         targetWs.send(JSON.stringify({
-            type: 'incoming_proposal',
-            id: `KNK-${Date.now()}`,
-            fromAddress: fromAddress,
-            fromName: data.fromName || "GUEST",
-            proposedTime: data.proposedTime
+            ...payload,
+            from: fromAddress
         }));
-        console.log(`✨ [KNOCK] Forwarded from ${fromAddress} to ${data.toAddress}`);
     } else {
-        console.log(`📭 [MISSED] ${data.toAddress} is offline. Proposal logged.`);
-        // Here you would typically save to a 'PendingProposals' DB table
+        console.log(`📭 Target ${toAddress} is currently offline.`);
     }
 }
 
-function _handleResponse(fromAddress, data) {
-    // Relays accept/decline back to the proposer
-    _relaySignal(fromAddress, data);
-}
-
-function _relaySignal(senderAddress, data) {
-    // This logic assumes the 'data' packet contains a 'to' or 'target' field
-    const targetId = data.toAddress || data.target || data.to;
-    if (!targetId) return;
-
-    const targetWs = registry.get(targetId.toUpperCase());
-    if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-        targetWs.send(JSON.stringify({
-            ...data,
-            from: senderAddress
-        }));
-    }
-}
-
-server.listen(PORT, () => {
-    console.log(`🚀 Presence Signal Plane active on port ${PORT}`);
+// CRITICAL: Railway requires the server to bind to 0.0.0.0
+server.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Presence Plane Online | Port: ${PORT}`);
+    console.log(`🔒 Persistence Engine Active`);
 });
