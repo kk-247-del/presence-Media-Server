@@ -6,7 +6,7 @@ const HEARTBEAT_INTERVAL = 30000;
 
 // Memory stores
 const sessions = new Map(); // sessionId → { a: WebSocket, b: WebSocket }
-const registry = new Map(); // address → { name, socket } (For finding peers)
+const registry = new Map(); // address → { name, socket }
 
 const log = (...args) => console.log(new Date().toISOString(), ...args);
 
@@ -27,12 +27,12 @@ function hardCollapse(ws, reason) {
   if (!s) return;
   const peer = getPeer(ws);
   if (peer) {
-    log(`[${ws.sessionId}] Terminating peer connection: ${reason}`);
+    log(`[${ws.sessionId}] Terminating peer: ${reason}`);
     safeSend(peer, { type: "presence_update", isPresent: false, reason });
     peer.terminate();
   }
   sessions.delete(ws.sessionId);
-  registry.delete(ws.sessionId); // Remove from lookup registry
+  registry.delete(ws.sessionId);
   ws.terminate();
   log(`[${ws.sessionId}] Room collapsed.`);
 }
@@ -46,34 +46,29 @@ const wss = new WebSocketServer({ server });
 
 wss.on("connection", (ws, req) => {
   ws.isAlive = true;
-  // Your official protocol: The Room ID is the Locus Address
+  // Use sub-protocol header as the Address (Contract: HAC295)
   ws.sessionId = req.headers['sec-websocket-protocol']?.toUpperCase() || "LOBBY";
 
-  // --- REGISTRY LOGIC ---
-  // We register the user so others can "Lookup" and "Knock"
+  // Register user for lookup/knocking
   registry.set(ws.sessionId, { socket: ws, name: "GUEST" });
 
   let s = sessions.get(ws.sessionId);
-
   if (!s) {
     s = { a: ws, b: null };
     sessions.set(ws.sessionId, s);
     log(`[${ws.sessionId}] Locus Active. Waiting for Peer B...`);
   } else if (!s.b) {
     s.b = ws;
-    log(`[${ws.sessionId}] Peer B matched. Launching Moment.`);
+    log(`[${ws.sessionId}] Peer B matched. Bridging pathway.`);
     safeSend(s.a, { type: "presence_update", isPresent: true, role: "initiator" });
     safeSend(s.b, { type: "presence_update", isPresent: true, role: "polite" });
-  } else {
-    ws.close(1000, "ROOM_FULL");
-    return;
   }
 
   ws.on("message", (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
 
-    // --- HARMONIZED FEATURE: LOOKUP ---
+    // --- FEATURE: LOOKUP ---
     if (msg.type === "lookup_address") {
       const target = registry.get(msg.address?.toUpperCase());
       safeSend(ws, { 
@@ -84,7 +79,7 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    // --- HARMONIZED FEATURE: KNOCK (Routing) ---
+    // --- FEATURE: KNOCKING ---
     if (msg.type === "send_proposal") {
       const target = registry.get(msg.toAddress?.toUpperCase());
       if (target) {
@@ -104,7 +99,7 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    // Official Passthrough (SDP/ICE/Signals)
+    // Official Passthrough for Live Signals (Text, Reveal, SDP)
     const peer = getPeer(ws);
     if (peer) peer.send(raw.toString());
   });
@@ -113,6 +108,7 @@ wss.on("connection", (ws, req) => {
     registry.delete(ws.sessionId);
     hardCollapse(ws, "socket_closed");
   });
+  ws.on("pong", () => (ws.isAlive = true));
 });
 
 setInterval(() => {
@@ -123,4 +119,4 @@ setInterval(() => {
   });
 }, HEARTBEAT_INTERVAL);
 
-server.listen(PORT, "0.0.0.0", () => log(`🚀 Harmonized Server on port ${PORT}`));
+server.listen(PORT, "0.0.0.0", () => log(`🚀 Server listening on ${PORT}`));
