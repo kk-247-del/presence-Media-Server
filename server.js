@@ -1,123 +1,78 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import { createServer } from 'http';
 
-// Railway dynamic port binding
 const PORT = process.env.PORT || 8080;
-
 const server = createServer((req, res) => {
     res.writeHead(200);
-    res.end("Presence Signal Plane is Active (ESM)\n");
+    res.end("Presence Validated Signal Plane Active\n");
 });
 
 const wss = new WebSocketServer({ server });
-
-/**
- * REGISTRY & PERSISTENCE
- * registry: active socket connections
- * mintedStore: every address ever generated (The Memory)
- */
-const registry = new Map();
-const mintedStore = new Set();
+const registry = new Map(); // Active Sockets
+const mintedStore = new Map(); // Persistent Memory { ID: { name, mintedAt } }
 
 wss.on('connection', (ws, req) => {
-    // 1. EXTRACT IDENTITY
     const protocol = req.headers['sec-websocket-protocol'];
     const address = protocol ? protocol.split(',')[0].trim().toUpperCase() : null;
 
-    if (!address) {
-        console.log("❌ REJECTED: Connection attempt without Locus ID.");
-        ws.terminate();
-        return;
-    }
-
-    // 2. REGISTER & PERSIST
-    registry.set(address, ws);
-    mintedStore.add(address); 
-    
-    console.log(`🌍 [MINTED/ONLINE] Identity: ${address}`);
-
-    // 3. SEND WELCOME SYNC
-    ws.send(JSON.stringify({
-        type: 'sync_success',
-        identity: address,
-        timestamp: new Date().toISOString()
-    }));
-
-    // 4. MESSAGE ROUTING
     ws.on('message', (message) => {
         try {
             const data = JSON.parse(message);
-            console.log(`📩 [${address}] -> ${data.type}`);
 
             switch (data.type) {
+                case 'register_identity':
+                    // VALIDATION: Must have 6-char ID and a real Nickname
+                    if (data.address.length === 6 && data.name && data.name !== "GUEST") {
+                        registry.set(data.address, ws);
+                        mintedStore.set(data.address, {
+                            name: data.name,
+                            mintedAt: new Date()
+                        });
+                        console.log(`💎 [VALIDATED MINT] ${data.address} is ${data.name}`);
+                    }
+                    break;
+
                 case 'lookup_address':
-                    _handleLookup(ws, data.address);
+                    const target = data.address.toUpperCase();
+                    const identity = mintedStore.get(target);
+                    
+                    ws.send(JSON.stringify({
+                        type: 'lookup_response',
+                        address: target,
+                        found: !!identity,
+                        name: identity ? identity.name : null,
+                        status: registry.has(target) ? 'online' : 'offline'
+                    }));
                     break;
 
                 case 'send_proposal':
-                    _relayToTarget(address, data.toAddress, {
+                    _relay(data.fromAddress, data.toAddress, {
                         type: 'incoming_proposal',
-                        fromAddress: address,
+                        fromAddress: data.fromAddress,
                         fromName: data.fromName,
                         proposedTime: data.proposedTime
                     });
                     break;
 
-                case 'respond_to_proposal':
-                    _relayToTarget(address, data.to, data);
-                    break;
-
                 default:
-                    _relayToTarget(address, data.to || data.target, data);
+                    _relay(data.from, data.to || data.target, data);
                     break;
             }
-        } catch (e) {
-            console.error("⚠️ Signal Error:", e);
-        }
+        } catch (e) { console.error("Signal Error:", e); }
     });
 
     ws.on('close', () => {
-        registry.delete(address);
-        console.log(`🌑 [OFFLINE] ${address}`);
-    });
-
-    ws.on('error', (err) => {
-        console.error(`🚨 Socket Error for ${address}:`, err);
+        // Remove from active registry, but keep in mintedStore (The Memory)
+        if (address) registry.delete(address);
     });
 });
 
-/* ── HELPERS ── */
-
-function _handleLookup(ws, targetAddress) {
-    if (!targetAddress) return;
-    const target = targetAddress.toUpperCase();
-    const isMinted = mintedStore.has(target);
-    const isOnline = registry.has(target);
-
-    ws.send(JSON.stringify({
-        type: 'lookup_response',
-        address: target,
-        found: isMinted, 
-        status: isOnline ? 'online' : 'offline',
-        name: isOnline ? "ACTIVE_PEER" : "OFFLINE_PEER"
-    }));
-}
-
-function _relayToTarget(fromAddress, toAddress, payload) {
-    if (!toAddress) return;
-    const targetWs = registry.get(toAddress.toUpperCase());
-
+function _relay(from, to, payload) {
+    if (!to) return;
+    const targetWs = registry.get(to.toUpperCase());
     if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-        targetWs.send(JSON.stringify({
-            ...payload,
-            from: fromAddress
-        }));
-    } else {
-        console.log(`📭 Target ${toAddress} is currently offline.`);
+        targetWs.send(JSON.stringify({ ...payload, from }));
     }
 }
 
-// Bind to 0.0.0.0 for cloud routing
-server.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Presence Plane Online (ESM) | Port: ${PORT}`);
-});
+server.listen(PORT, '0.0.0.0', () => console.log(`🚀 Plane Live on ${PORT}`));
