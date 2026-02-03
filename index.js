@@ -1,116 +1,157 @@
-import http from "http";
-import { WebSocketServer, WebSocket } from "ws";
-import crypto from "crypto";
+const WebSocket = require('ws');
 
-const PORT = process.env.PORT || 8080;
-const HEARTBEAT_INTERVAL = 30000;
-const COLLAPSE_GRACE_SECONDS = 10;
+const wss = new WebSocket.Server({ port: 8080 });
 
-// sessionId → { a: WebSocket, b: WebSocket, timer: Timeout | null }
-const sessions = new Map();
-let registry = []; // For the Presence/Dashboard screens
+/**
+ * GLOBAL REGISTRY
+ * Maps address IDs to Presence Objects:
+ * { id, nickname, duration, expiresAt, isPersistent, socket? }
+ */
+let registry = new Map();
 
-const log = (...args) => console.log(new Date().toISOString(), ...args);
+console.log("PRESENCE SIGNAL SERVER STARTING...");
 
-function safeSend(ws, msg) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(msg));
-  }
-}
-
-const getPeer = (ws) => {
-  const s = sessions.get(ws.sessionId);
-  if (!s) return null;
-  return s.a === ws ? s.b : s.a;
-};
-
-function broadcastDashboard() {
-  const msg = JSON.stringify({ type: 'dashboard_sync', list: registry });
-  wss.clients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) client.send(msg);
-  });
-}
-
-function hardCollapse(ws, reason) {
-  const s = sessions.get(ws.sessionId);
-  if (!s) return;
-
-  const peer = getPeer(ws);
-  if (peer) safeSend(peer, { type: "collapse", reason });
-
-  if (s.a === ws) s.a = null;
-  if (s.b === ws) s.b = null;
-  if (!s.a && !s.b) sessions.delete(ws.sessionId);
-  
-  ws.terminate();
-}
-
-const server = http.createServer((req, res) => {
-  res.writeHead(200);
-  res.end("Presence Registry Active");
-});
-
-const wss = new WebSocketServer({ server });
-
-wss.on("connection", (ws, req) => {
-  ws.isAlive = true;
-  ws.sessionId = null;
-
-  log("✨ New Connection Established");
-
-  ws.on("pong", () => ws.isAlive = true);
-
-  ws.on("message", (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw); } catch { return; }
-
-    switch (msg.type) {
-      case 'register':
-        // Handshake to get initial dashboard
-        ws.send(JSON.stringify({ type: 'dashboard_sync', list: registry }));
-        break;
-
-      case 'reserve':
-        const newAddress = {
-          id: msg.id || crypto.randomBytes(3).toString('hex').toUpperCase(),
-          nickname: msg.nickname,
-          expiresAt: Date.now() + (msg.duration * 3600000)
-        };
-        registry.push(newAddress);
-        broadcastDashboard();
-        break;
-
-      case 'join':
-        ws.sessionId = msg.address;
-        let s = sessions.get(ws.sessionId);
-        if (!s) {
-          s = { a: ws, b: null };
-          sessions.set(ws.sessionId, s);
-        } else if (!s.b) {
-          s.b = ws;
-          safeSend(s.a, { type: "ready", role: "initiator" });
-          safeSend(s.b, { type: "ready", role: "polite" });
-        }
-        break;
-
-      default:
-        const peer = getPeer(ws);
-        if (peer) safeSend(peer, msg);
-        break;
+wss.on('connection', (ws, req) => {
+    // The protocol header contains the requested Address ID
+    const addressId = req.headers['sec-websocket-protocol'];
+    
+    if (!addressId) {
+        console.log("REJECTED: No Address ID provided.");
+        ws.close();
+        return;
     }
-  });
 
-  ws.on("close", () => {
-    if (ws.sessionId) hardCollapse(ws, "socket_closed");
-  });
+    console.log(`SESSION REQUEST: ${addressId}`);
+
+    // 1. HANDLE MESSAGES
+    ws.on('message', (message) => {
+        const msg = JSON.parse(message);
+
+        switch (msg.type) {
+            case 'reserve_request':
+                handleReserve(msg);
+                break;
+
+            case 'delete_request':
+                handleDelete(msg.id);
+                break;
+
+            case 'identity_broadcast':
+                handleBroadcast(addressId, msg);
+                break;
+
+            case 'webrtc_offer':
+            case 'webrtc_answer':
+            case 'webrtc_ice':
+                relaySignal(addressId, msg);
+                break;
+        }
+    });
+
+    // 2. JOIN LOGIC
+    // Link the active socket to the registry entry
+    let entry = registry.get(addressId);
+    if (!entry) {
+        // Create an ephemeral entry if it doesn't exist (Guest Login)
+        entry = { id: addressId, nickname: "GUEST", isPersistent: false };
+        registry.set(addressId, entry);
+    }
+    
+    entry.socket = ws;
+
+    // 3. HANDSHAKE (Determine Roles)
+    const peers = Array.from(wss.clients).filter(c => 
+        c !== ws && c.protocol === addressId && c.readyState === WebSocket.OPEN
+    );
+
+    if (peers.length > 0) {
+        console.log(`PEER MATCH: ${addressId}`);
+        // Send 'ready' to both sides with roles
+        ws.send(json({ type: 'ready', role: 'initiator' }));
+        peers[0].send(json({ type: 'ready', role: 'polite' }));
+    }
+
+    // 4. DISCONNECT LOGIC
+    ws.on('close', () => {
+        const currentEntry = registry.get(addressId);
+        if (currentEntry && !currentEntry.isPersistent) {
+            // Only delete from registry if it wasn't a "Minted" address
+            registry.delete(addressId);
+            broadcastRegistry();
+        } else if (currentEntry) {
+            // Keep reserved address, but mark as offline
+            currentEntry.socket = null;
+        }
+    });
 });
 
-setInterval(() => {
-  wss.clients.forEach((ws) => {
-    if (!ws.isAlive) return ws.terminate();
-    ws.isAlive = false;
-    ws.ping();
-  });
-}, HEARTBEAT_INTERVAL);
+// --- ENGINE LOGIC ---
 
-server.listen(PORT, "0.0.0.0", () => log(`🚀 Server listening on ${PORT}`));
+function handleReserve(data) {
+    const expiresAt = Date.now() + (data.hours * 3600000);
+    registry.set(data.address, {
+        id: data.address,
+        nickname: data.nickname,
+        duration: data.hours,
+        expiresAt: expiresAt,
+        isPersistent: true,
+        socket: null
+    });
+    console.log(`MINTED: ${data.address} for ${data.nickname}`);
+    broadcastRegistry();
+}
+
+function handleDelete(id) {
+    registry.delete(id);
+    console.log(`PURGED: ${id}`);
+    broadcastRegistry();
+}
+
+function handleBroadcast(id, msg) {
+    const entry = registry.get(id);
+    if (entry) entry.nickname = msg.nickname;
+    broadcastRegistry();
+}
+
+function relaySignal(addressId, msg) {
+    // Relay WebRTC data to the other socket in the same "room"
+    wss.clients.forEach(client => {
+        if (client.protocol === addressId && client.readyState === WebSocket.OPEN && client !== registry.get(addressId).socket) {
+            client.send(JSON.stringify(msg));
+        }
+    });
+}
+
+function broadcastRegistry() {
+    const data = JSON.stringify({
+        type: 'registry_update',
+        addresses: Array.from(registry.values()).map(e => ({
+            id: e.id,
+            nickname: e.nickname,
+            remainingTime: e.isPersistent ? formatTTL(e.expiresAt) : "EPHEMERAL"
+        }))
+    });
+    wss.clients.forEach(client => client.send(data));
+}
+
+// --- UTILS ---
+
+function formatTTL(expiry) {
+    const diff = expiry - Date.now();
+    if (diff <= 0) return "EXPIRED";
+    const hours = Math.floor(diff / 3600000);
+    return hours === 0 ? "SINGLE USE" : `${hours}H LEFT`;
+}
+
+function json(obj) { return JSON.stringify(obj); }
+
+// Cleanup expired addresses every 5 minutes
+setInterval(() => {
+    const now = Date.now();
+    registry.forEach((v, k) => {
+        if (v.isPersistent && v.expiresAt < now) {
+            registry.delete(k);
+        }
+    });
+    broadcastRegistry();
+}, 300000);
