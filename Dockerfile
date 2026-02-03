@@ -2,14 +2,15 @@ FROM node:20-alpine
 
 WORKDIR /app
 
+# Install dependencies
 COPY package.json ./
 RUN npm install --production
 
-COPY server.js ./
+# Copy the server code (Ensure this matches your filename!)
+COPY index.js ./ 
 
 ENV NODE_ENV=production
-ENV PORT=8080
-
+# The port is provided by Railway at runtime
 EXPOSE 8080
 
-CMD ["npm", "start"]
+CMD ["node", "index.js"]
