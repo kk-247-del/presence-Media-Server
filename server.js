@@ -1,128 +1,122 @@
- import { WebSocketServer, WebSocket } from 'ws';
-import { createServer } from 'http';
+import http from "http";
+import { WebSocketServer, WebSocket } from "ws";
 
 const PORT = process.env.PORT || 8080;
-const CVC_REGEX = /^[BCDFGHJKLMNPQRSTVWYZ][AEIU][BCDFGHJKLMNPQRSTVWYZ]\d{3}$/;
+const HEARTBEAT_INTERVAL = 30000;
 
-const server = createServer((req, res) => {
-    res.writeHead(200);
-    res.end("Presence Plane: Express & Registry Link Active\n");
+// Memory stores
+const sessions = new Map(); // sessionId → { a: WebSocket, b: WebSocket }
+const registry = new Map(); // address → { name, socket }
+
+const log = (...args) => console.log(new Date().toISOString(), ...args);
+
+function safeSend(ws, msg) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(msg));
+  }
+}
+
+const getPeer = (ws) => {
+  const s = sessions.get(ws.sessionId);
+  if (!s) return null;
+  return s.a === ws ? s.b : s.a;
+};
+
+function hardCollapse(ws, reason) {
+  const s = sessions.get(ws.sessionId);
+  if (!s) return;
+  const peer = getPeer(ws);
+  if (peer) {
+    log(`[${ws.sessionId}] Terminating peer: ${reason}`);
+    safeSend(peer, { type: "presence_update", isPresent: false, reason });
+    peer.terminate();
+  }
+  sessions.delete(ws.sessionId);
+  registry.delete(ws.sessionId);
+  ws.terminate();
+  log(`[${ws.sessionId}] Room collapsed.`);
+}
+
+const server = http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end("Locus Control Plane: Harmonized");
 });
 
 const wss = new WebSocketServer({ server });
 
-const registry = new Map(); // Address -> WebSocket
-const waitingPeers = new Set(); // Addresses currently in 'Waiting' mode
-const activeProposals = new Map(); // Proposal ID -> { from, to }
+wss.on("connection", (ws, req) => {
+  ws.isAlive = true;
+  // Use sub-protocol header as the Address (Contract: HAC295)
+  ws.sessionId = req.headers['sec-websocket-protocol']?.toUpperCase() || "LOBBY";
 
-wss.on('connection', (ws, req) => {
-    const protocol = req.headers['sec-websocket-protocol'];
-    let sessionAddress = protocol ? protocol.split(',')[0].trim().toUpperCase() : null;
+  // Register user for lookup/knocking
+  registry.set(ws.sessionId, { socket: ws, name: "GUEST" });
 
-    // AUTO-REGISTRATION: Handles Express Addresses immediately on socket open
-    if (sessionAddress && CVC_REGEX.test(sessionAddress)) {
-        registry.set(sessionAddress, ws);
-        console.log(`🔌 [PROTOCOL AUTH] ${sessionAddress} entered the plane.`);
+  let s = sessions.get(ws.sessionId);
+  if (!s) {
+    s = { a: ws, b: null };
+    sessions.set(ws.sessionId, s);
+    log(`[${ws.sessionId}] Locus Active. Waiting for Peer B...`);
+  } else if (!s.b) {
+    s.b = ws;
+    log(`[${ws.sessionId}] Peer B matched. Bridging pathway.`);
+    safeSend(s.a, { type: "presence_update", isPresent: true, role: "initiator" });
+    safeSend(s.b, { type: "presence_update", isPresent: true, role: "polite" });
+  }
+
+  ws.on("message", (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+
+    // --- FEATURE: LOOKUP ---
+    if (msg.type === "lookup_address") {
+      const target = registry.get(msg.address?.toUpperCase());
+      safeSend(ws, { 
+        type: "lookup_response", 
+        found: !!target, 
+        name: target ? target.name : null 
+      });
+      return;
     }
 
-    ws.on('message', (message) => {
-        try {
-            const data = JSON.parse(message);
-            const fromAddr = data.from || sessionAddress;
+    // --- FEATURE: KNOCKING ---
+    if (msg.type === "send_proposal") {
+      const target = registry.get(msg.toAddress?.toUpperCase());
+      if (target) {
+        safeSend(target.socket, {
+          type: "incoming_proposal",
+          fromName: msg.fromName,
+          fromAddress: msg.fromAddress,
+          proposedTime: msg.proposedTime
+        });
+      }
+      return;
+    }
 
-            switch (data.type) {
-                case 'register_identity':
-                    if (CVC_REGEX.test(data.address)) {
-                        registry.set(data.address.toUpperCase(), ws);
-                        // If they register, they are online but not necessarily "waiting" yet
-                    }
-                    break;
+    if (msg.type === "heartbeat") {
+      ws.isAlive = true;
+      if (msg.foreground === false) hardCollapse(ws, "peer_backgrounded");
+      return;
+    }
 
-                case 'lookup_address':
-                    const target = data.address.toUpperCase();
-                    ws.send(JSON.stringify({
-                        type: 'lookup_response',
-                        address: target,
-                        found: registry.has(target), // Found if online (Express or Registry)
-                        status: waitingPeers.has(target) ? 'waiting' : (registry.has(target) ? 'online' : 'offline')
-                    }));
-                    break;
+    // Official Passthrough for Live Signals (Text, Reveal, SDP)
+    const peer = getPeer(ws);
+    if (peer) peer.send(raw.toString());
+  });
 
-                case 'send_proposal':
-                    // This is the "Knock" flow
-                    const proposalId = `KNK-${Date.now()}`;
-                    activeProposals.set(proposalId, { from: data.fromAddress, to: data.toAddress });
-                    _relay(data.fromAddress, data.toAddress, {
-                        type: 'incoming_proposal',
-                        id: proposalId,
-                        fromAddress: data.fromAddress,
-                        fromName: data.fromName,
-                        proposedTime: data.proposedTime
-                    });
-                    break;
-
-                case 'respond_to_proposal':
-                    const prop = activeProposals.get(data.id);
-                    if (prop && data.action === 'accept') {
-                        _establishMoment(prop.from, prop.to);
-                    }
-                    activeProposals.delete(data.id);
-                    break;
-
-                // NEW: Handle the "Waiting" state for direct Express connections
-                case 'signal': 
-                    // If a user sends a signal of type 'waiting', we track them
-                    if (data.data === 'waiting') {
-                        waitingPeers.add(fromAddr);
-                        console.log(`⏳ [WAITING] ${fromAddr} is ready for express join.`);
-                    }
-                    break;
-
-                default:
-                    // DIRECT JOIN LOGIC: If I send a signal to someone who is waiting,
-                    // and it's not a proposal (it's a direct action), we connect them.
-                    const targetTo = data.to || data.target;
-                    if (targetTo && waitingPeers.has(targetTo.toUpperCase())) {
-                        _establishMoment(fromAddr, targetTo);
-                    } else {
-                        _relay(fromAddr, targetTo, data);
-                    }
-                    break;
-            }
-        } catch (e) { console.error("Signal Error:", e); }
-    });
-
-    ws.on('close', () => {
-        if (sessionAddress) {
-            registry.delete(sessionAddress);
-            waitingPeers.delete(sessionAddress);
-        }
-    });
+  ws.on("close", () => {
+    registry.delete(ws.sessionId);
+    hardCollapse(ws, "socket_closed");
+  });
+  ws.on("pong", () => (ws.isAlive = true));
 });
 
-/**
- * Triggers the Flutter 'presence_update' to move both users to the MomentSurface
- */
-function _establishMoment(peerA, peerB) {
-    _notify(peerA, { type: 'presence_update', isPresent: true, role: "PEER" });
-    _notify(peerB, { type: 'presence_update', isPresent: true, role: "PEER" });
-    
-    // Once they are in a Moment, they are no longer "waiting" for others
-    waitingPeers.delete(peerA.toUpperCase());
-    waitingPeers.delete(peerB.toUpperCase());
-    
-    console.log(`✨ [MOMENT] ${peerA} <-> ${peerB}`);
-}
+setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (!ws.isAlive) return ws.terminate();
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, HEARTBEAT_INTERVAL);
 
-function _notify(addr, payload) {
-    const ws = registry.get(addr.toUpperCase());
-    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
-}
-
-function _relay(from, to, payload) {
-    if (!to) return;
-    const ws = registry.get(to.toUpperCase());
-    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ ...payload, from }));
-}
-
-server.listen(PORT, '0.0.0.0', () => console.log(`🚀 Plane Live on ${PORT}`));
+server.listen(PORT, "0.0.0.0", () => log(`🚀 Server listening on ${PORT}`));
