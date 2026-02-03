@@ -2,71 +2,89 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createServer } from 'http';
 
 const PORT = process.env.PORT || 8080;
+const CVC_REGEX = /^[BCDFGHJKLMNPQRSTVWYZ][AEIU][BCDFGHJKLMNPQRSTVWYZ]\d{3}$/;
+
 const server = createServer((req, res) => {
     res.writeHead(200);
     res.end("Presence Validated Signal Plane Active\n");
 });
 
 const wss = new WebSocketServer({ server });
-const registry = new Map(); // Active Sockets
-const mintedStore = new Map(); // Persistent Memory { ID: { name, mintedAt } }
+const registry = new Map(); // Address -> WebSocket Mapping
+const activeProposals = new Map(); // ProposalID -> { from, to }
 
 wss.on('connection', (ws, req) => {
     const protocol = req.headers['sec-websocket-protocol'];
-    const address = protocol ? protocol.split(',')[0].trim().toUpperCase() : null;
+    let sessionAddress = protocol ? protocol.split(',')[0].trim().toUpperCase() : null;
+
+    if (sessionAddress && CVC_REGEX.test(sessionAddress)) {
+        registry.set(sessionAddress, ws);
+        console.log(`🔌 [ONLINE] ${sessionAddress}`);
+    }
 
     ws.on('message', (message) => {
         try {
             const data = JSON.parse(message);
 
             switch (data.type) {
-                case 'register_identity':
-                    // VALIDATION: Must have 6-char ID and a real Nickname
-                    if (data.address.length === 6 && data.name && data.name !== "GUEST") {
-                        registry.set(data.address, ws);
-                        mintedStore.set(data.address, {
-                            name: data.name,
-                            mintedAt: new Date()
-                        });
-                        console.log(`💎 [VALIDATED MINT] ${data.address} is ${data.name}`);
-                    }
-                    break;
-
-                case 'lookup_address':
-                    const target = data.address.toUpperCase();
-                    const identity = mintedStore.get(target);
-                    
-                    ws.send(JSON.stringify({
-                        type: 'lookup_response',
-                        address: target,
-                        found: !!identity,
-                        name: identity ? identity.name : null,
-                        status: registry.has(target) ? 'online' : 'offline'
-                    }));
-                    break;
-
                 case 'send_proposal':
+                    const proposalId = `KNK-${Date.now()}`;
+                    activeProposals.set(proposalId, { from: data.fromAddress, to: data.toAddress });
+                    
                     _relay(data.fromAddress, data.toAddress, {
                         type: 'incoming_proposal',
+                        id: proposalId,
                         fromAddress: data.fromAddress,
                         fromName: data.fromName,
                         proposedTime: data.proposedTime
                     });
                     break;
 
+                case 'respond_to_proposal':
+                    const proposal = activeProposals.get(data.id);
+                    if (!proposal) return;
+
+                    if (data.action === 'accept') {
+                        // Notify BOTH peers to transition to the "Moment"
+                        // This triggers the 'presence_update' listener in MeetingEngine
+                        _notifyPeerState(proposal.from, true, "PEER");
+                        _notifyPeerState(proposal.to, true, "PEER");
+                        console.log(`🔗 [MOMENT STARTED] ${proposal.from} <-> ${proposal.to}`);
+                    }
+                    activeProposals.delete(data.id);
+                    break;
+
                 default:
-                    _relay(data.from, data.to || data.target, data);
+                    // Relays Live Text, Reveal frames, and Haptics
+                    const relayTo = data.to || data.target;
+                    _relay(data.from || sessionAddress, relayTo, data);
                     break;
             }
         } catch (e) { console.error("Signal Error:", e); }
     });
 
     ws.on('close', () => {
-        // Remove from active registry, but keep in mintedStore (The Memory)
-        if (address) registry.delete(address);
+        if (sessionAddress) registry.delete(sessionAddress);
     });
 });
 
+/**
+ * Sends a state update to a specific address
+ */
+function _notifyPeerState(address, isPresent, role) {
+    const targetWs = registry.get(address.toUpperCase());
+    if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+        targetWs.send(JSON.stringify({
+            type: 'presence_update',
+            isPresent: isPresent,
+            role: role
+        }));
+    }
+}
+
+/**
+ * Raw Signal Relay
+ */
 function _relay(from, to, payload) {
     if (!to) return;
     const targetWs = registry.get(to.toUpperCase());
