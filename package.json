@@ -1,11 +1,15 @@
 {
-  "name": "presence-signaling-server",
+  "name": "presence-signal-core",
   "version": "1.0.0",
-  "main": "index.js",
-  "dependencies": {
-    "ws": "^8.13.0"
-  },
+  "description": "Heavyweight signaling server for Presence",
+  "main": "server.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
