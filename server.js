@@ -1,123 +1,80 @@
-import { WebSocketServer, WebSocket } from 'ws';
-import { createServer } from 'http';
+const { WebSocketServer } = require('ws');
+const http = require('http');
 
-// Railway dynamic port binding
-const PORT = process.env.PORT || 8080;
-
-const server = createServer((req, res) => {
-    res.writeHead(200);
-    res.end("Presence Signal Plane is Active (ESM)\n");
+const port = process.env.PORT || 8080;
+const server = http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end('Signaling Server is running');
 });
 
 const wss = new WebSocketServer({ server });
 
-/**
- * REGISTRY & PERSISTENCE
- * registry: active socket connections
- * mintedStore: every address ever generated (The Memory)
- */
-const registry = new Map();
-const mintedStore = new Set();
+// Map to track peers in rooms: { "roomID": [socket1, socket2] }
+const rooms = new Map();
 
 wss.on('connection', (ws, req) => {
-    // 1. EXTRACT IDENTITY
-    const protocol = req.headers['sec-websocket-protocol'];
-    const address = protocol ? protocol.split(',')[0].trim().toUpperCase() : null;
+  // Your Dart code sends the 'address' via the protocol header
+  const roomId = ws.protocol;
 
-    if (!address) {
-        console.log("❌ REJECTED: Connection attempt without Locus ID.");
-        ws.terminate();
-        return;
-    }
+  if (!roomId) {
+    console.log("Connection rejected: No address (protocol) provided.");
+    ws.close(1002, "Protocol required");
+    return;
+  }
 
-    // 2. REGISTER & PERSIST
-    registry.set(address, ws);
-    mintedStore.add(address); 
+  // Initialize room if it doesn't exist
+  if (!rooms.has(roomId)) {
+    rooms.set(roomId, []);
+  }
+
+  const clients = rooms.get(roomId);
+
+  if (clients.length >= 2) {
+    console.log(`Room ${roomId} is full.`);
+    ws.close(1013, "Room Full");
+    return;
+  }
+
+  // Add client to room
+  clients.push(ws);
+  console.log(`User joined room: ${roomId}. Total: ${clients.length}`);
+
+  // If this is the second user, notify both to start WebRTC
+  if (clients.length === 2) {
+    const [peer1, peer2] = clients;
     
-    console.log(`🌍 [MINTED/ONLINE] Identity: ${address}`);
+    // Peer 1 was there first (Initiator)
+    peer1.send(JSON.stringify({ type: 'presence_update', isPresent: true, role: 'initiator' }));
+    // Peer 2 just joined (Polite)
+    peer2.send(JSON.stringify({ type: 'presence_update', isPresent: true, role: 'polite' }));
+  }
 
-    // 3. SEND WELCOME SYNC
-    ws.send(JSON.stringify({
-        type: 'sync_success',
-        identity: address,
-        timestamp: new Date().toISOString()
-    }));
+  ws.on('message', (data) => {
+    // Relay message to the OTHER person in the room
+    const message = data.toString();
+    const otherPeer = clients.find(client => client !== ws);
+    
+    if (otherPeer && otherPeer.readyState === 1) {
+      otherPeer.send(message);
+    }
+  });
 
-    // 4. MESSAGE ROUTING
-    ws.on('message', (message) => {
-        try {
-            const data = JSON.parse(message);
-            console.log(`📩 [${address}] -> ${data.type}`);
-
-            switch (data.type) {
-                case 'lookup_address':
-                    _handleLookup(ws, data.address);
-                    break;
-
-                case 'send_proposal':
-                    _relayToTarget(address, data.toAddress, {
-                        type: 'incoming_proposal',
-                        fromAddress: address,
-                        fromName: data.fromName,
-                        proposedTime: data.proposedTime
-                    });
-                    break;
-
-                case 'respond_to_proposal':
-                    _relayToTarget(address, data.to, data);
-                    break;
-
-                default:
-                    _relayToTarget(address, data.to || data.target, data);
-                    break;
-            }
-        } catch (e) {
-            console.error("⚠️ Signal Error:", e);
-        }
-    });
-
-    ws.on('close', () => {
-        registry.delete(address);
-        console.log(`🌑 [OFFLINE] ${address}`);
-    });
-
-    ws.on('error', (err) => {
-        console.error(`🚨 Socket Error for ${address}:`, err);
-    });
+  ws.on('close', () => {
+    const index = clients.indexOf(ws);
+    if (index > -1) {
+      clients.splice(index, 1);
+    }
+    
+    // Notify remaining peer that the other left
+    if (clients.length === 1) {
+      clients[0].send(JSON.stringify({ type: 'presence_update', isPresent: false }));
+    } else {
+      rooms.delete(roomId);
+    }
+    console.log(`User left room: ${roomId}`);
+  });
 });
 
-/* ── HELPERS ── */
-
-function _handleLookup(ws, targetAddress) {
-    if (!targetAddress) return;
-    const target = targetAddress.toUpperCase();
-    const isMinted = mintedStore.has(target);
-    const isOnline = registry.has(target);
-
-    ws.send(JSON.stringify({
-        type: 'lookup_response',
-        address: target,
-        found: isMinted, 
-        status: isOnline ? 'online' : 'offline',
-        name: isOnline ? "ACTIVE_PEER" : "OFFLINE_PEER"
-    }));
-}
-
-function _relayToTarget(fromAddress, toAddress, payload) {
-    if (!toAddress) return;
-    const targetWs = registry.get(toAddress.toUpperCase());
-
-    if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-        targetWs.send(JSON.stringify({
-            ...payload,
-            from: fromAddress
-        }));
-    } else {
-        console.log(`📭 Target ${toAddress} is currently offline.`);
-    }
-}
-
-// Bind to 0.0.0.0 for cloud routing
-server.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Presence Plane Online (ESM) | Port: ${PORT}`);
+server.listen(port, () => {
+  console.log(`Server listening on port ${port}`);
 });
