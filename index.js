@@ -1,157 +1,111 @@
 const WebSocket = require('ws');
+const http = require('http');
 
-const wss = new WebSocket.Server({ port: 8080 });
-
-/**
- * GLOBAL REGISTRY
- * Maps address IDs to Presence Objects:
- * { id, nickname, duration, expiresAt, isPersistent, socket? }
- */
+const PORT = process.env.PORT || 8080;
 let registry = new Map();
 
-console.log("PRESENCE SIGNAL SERVER STARTING...");
+// 1. Create a standard HTTP server to handle both the Dashboard and the WebSocket upgrade
+const server = http.createServer((req, res) => {
+    if (req.url === '/status') {
+        // Serve a JSON snapshot of the internal state
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        const status = {
+            totalConnections: wss.clients.size,
+            activeRooms: Array.from(registry.keys()),
+            registry: Array.from(registry.values()).map(e => ({
+                ...e,
+                socket: e.socket ? 'CONNECTED' : 'OFFLINE'
+            }))
+        };
+        return res.end(JSON.stringify(status, null, 2));
+    }
+
+    // Simple HTML Dashboard
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Presence Orbit | Dashboard</title>
+            <style>
+                body { background: #0f0f0f; color: #00ffaa; font-family: monospace; padding: 40px; }
+                .card { border: 1px solid #333; padding: 20px; margin-bottom: 10px; border-radius: 8px; }
+                .live { color: #ff3366; animation: blink 1s infinite; }
+                @keyframes blink { 50% { opacity: 0; } }
+            </style>
+        </head>
+        <body>
+            <h1>PRESENCE <span class="live">●</span> SIGNAL_CORE</h1>
+            <div id="stats">Loading telemetry...</div>
+            <script>
+                async function update() {
+                    const res = await fetch('/status');
+                    const data = await res.json();
+                    document.getElementById('stats').innerHTML = 
+                        '<div class="card">ACTIVE_SOCKETS: ' + data.totalConnections + '</div>' +
+                        data.registry.map(r => '<div class="card">' + r.id + ' | ' + r.nickname + ' [' + r.socket + ']</div>').join('');
+                }
+                setInterval(update, 2000); update();
+            </script>
+        </body>
+        </html>
+    `);
+});
+
+// 2. Attach the WebSocket server to the HTTP server
+const wss = new WebSocket.Server({ server });
+
+
 
 wss.on('connection', (ws, req) => {
-    // The protocol header contains the requested Address ID
     const addressId = req.headers['sec-websocket-protocol'];
-    
-    if (!addressId) {
-        console.log("REJECTED: No Address ID provided.");
-        ws.close();
-        return;
-    }
+    if (!addressId) return ws.close();
 
-    console.log(`SESSION REQUEST: ${addressId}`);
+    console.log(`SESSION: ${addressId}`);
 
-    // 1. HANDLE MESSAGES
     ws.on('message', (message) => {
-        const msg = JSON.parse(message);
-
-        switch (msg.type) {
-            case 'reserve_request':
-                handleReserve(msg);
-                break;
-
-            case 'delete_request':
-                handleDelete(msg.id);
-                break;
-
-            case 'identity_broadcast':
-                handleBroadcast(addressId, msg);
-                break;
-
-            case 'webrtc_offer':
-            case 'webrtc_answer':
-            case 'webrtc_ice':
-                relaySignal(addressId, msg);
-                break;
-        }
+        try {
+            const msg = JSON.parse(message);
+            
+            // Handle specific logic types
+            if (msg.type === 'reserve_request') return handleReserve(msg);
+            if (msg.type === 'delete_request') return handleDelete(msg.id);
+            
+            // Relay all other messages (WebRTC, Text, etc.)
+            relaySignal(addressId, msg, ws);
+        } catch (e) { console.error(e); }
     });
 
-    // 2. JOIN LOGIC
-    // Link the active socket to the registry entry
-    let entry = registry.get(addressId);
-    if (!entry) {
-        // Create an ephemeral entry if it doesn't exist (Guest Login)
-        entry = { id: addressId, nickname: "GUEST", isPersistent: false };
-        registry.set(addressId, entry);
-    }
-    
-    entry.socket = ws;
-
-    // 3. HANDSHAKE (Determine Roles)
+    // Determine Roles on Join
     const peers = Array.from(wss.clients).filter(c => 
         c !== ws && c.protocol === addressId && c.readyState === WebSocket.OPEN
     );
 
     if (peers.length > 0) {
-        console.log(`PEER MATCH: ${addressId}`);
-        // Send 'ready' to both sides with roles
-        ws.send(json({ type: 'ready', role: 'initiator' }));
-        peers[0].send(json({ type: 'ready', role: 'polite' }));
+        ws.send(JSON.stringify({ type: 'ready', role: 'initiator' }));
+        peers[0].send(JSON.stringify({ type: 'ready', role: 'polite' }));
     }
-
-    // 4. DISCONNECT LOGIC
-    ws.on('close', () => {
-        const currentEntry = registry.get(addressId);
-        if (currentEntry && !currentEntry.isPersistent) {
-            // Only delete from registry if it wasn't a "Minted" address
-            registry.delete(addressId);
-            broadcastRegistry();
-        } else if (currentEntry) {
-            // Keep reserved address, but mark as offline
-            currentEntry.socket = null;
-        }
-    });
 });
 
-// --- ENGINE LOGIC ---
-
-function handleReserve(data) {
-    const expiresAt = Date.now() + (data.hours * 3600000);
-    registry.set(data.address, {
-        id: data.address,
-        nickname: data.nickname,
-        duration: data.hours,
-        expiresAt: expiresAt,
-        isPersistent: true,
-        socket: null
-    });
-    console.log(`MINTED: ${data.address} for ${data.nickname}`);
-    broadcastRegistry();
-}
-
-function handleDelete(id) {
-    registry.delete(id);
-    console.log(`PURGED: ${id}`);
-    broadcastRegistry();
-}
-
-function handleBroadcast(id, msg) {
-    const entry = registry.get(id);
-    if (entry) entry.nickname = msg.nickname;
-    broadcastRegistry();
-}
-
-function relaySignal(addressId, msg) {
-    // Relay WebRTC data to the other socket in the same "room"
+function relaySignal(addressId, msg, senderWs) {
     wss.clients.forEach(client => {
-        if (client.protocol === addressId && client.readyState === WebSocket.OPEN && client !== registry.get(addressId).socket) {
+        if (client.protocol === addressId && client.readyState === WebSocket.OPEN && client !== senderWs) {
             client.send(JSON.stringify(msg));
         }
     });
 }
 
-function broadcastRegistry() {
-    const data = JSON.stringify({
-        type: 'registry_update',
-        addresses: Array.from(registry.values()).map(e => ({
-            id: e.id,
-            nickname: e.nickname,
-            remainingTime: e.isPersistent ? formatTTL(e.expiresAt) : "EPHEMERAL"
-        }))
+function handleReserve(data) {
+    registry.set(data.address, {
+        id: data.address,
+        nickname: data.nickname,
+        expiresAt: Date.now() + (data.hours * 3600000),
+        isPersistent: true
     });
-    wss.clients.forEach(client => client.send(data));
 }
 
-// --- UTILS ---
-
-function formatTTL(expiry) {
-    const diff = expiry - Date.now();
-    if (diff <= 0) return "EXPIRED";
-    const hours = Math.floor(diff / 3600000);
-    return hours === 0 ? "SINGLE USE" : `${hours}H LEFT`;
+function handleDelete(id) {
+    registry.delete(id);
 }
 
-function json(obj) { return JSON.stringify(obj); }
-
-// Cleanup expired addresses every 5 minutes
-setInterval(() => {
-    const now = Date.now();
-    registry.forEach((v, k) => {
-        if (v.isPersistent && v.expiresAt < now) {
-            registry.delete(k);
-        }
-    });
-    broadcastRegistry();
-}, 300000);
+server.listen(PORT, () => console.log(`CORE_READY: PORT ${PORT}`));
