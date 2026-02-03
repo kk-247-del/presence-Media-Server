@@ -1,111 +1,116 @@
-const { WebSocketServer } = require('ws');
-const http = require('http');
+import http from "http";
+import { WebSocketServer, WebSocket } from "ws";
+import crypto from "crypto";
 
-const port = process.env.PORT || 8080;
+const PORT = process.env.PORT || 8080;
+const HEARTBEAT_INTERVAL = 30000;
+const COLLAPSE_GRACE_SECONDS = 10;
 
-// Simple HTTP server to satisfy Railway's health checks
+// sessionId → { a: WebSocket, b: WebSocket, timer: Timeout | null }
+const sessions = new Map();
+let registry = []; // For the Presence/Dashboard screens
+
+const log = (...args) => console.log(new Date().toISOString(), ...args);
+
+function safeSend(ws, msg) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(msg));
+  }
+}
+
+const getPeer = (ws) => {
+  const s = sessions.get(ws.sessionId);
+  if (!s) return null;
+  return s.a === ws ? s.b : s.a;
+};
+
+function broadcastDashboard() {
+  const msg = JSON.stringify({ type: 'dashboard_sync', list: registry });
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) client.send(msg);
+  });
+}
+
+function hardCollapse(ws, reason) {
+  const s = sessions.get(ws.sessionId);
+  if (!s) return;
+
+  const peer = getPeer(ws);
+  if (peer) safeSend(peer, { type: "collapse", reason });
+
+  if (s.a === ws) s.a = null;
+  if (s.b === ws) s.b = null;
+  if (!s.a && !s.b) sessions.delete(ws.sessionId);
+  
+  ws.terminate();
+}
+
 const server = http.createServer((req, res) => {
-    res.writeHead(200);
-    res.end('Signaling Server is Live');
+  res.writeHead(200);
+  res.end("Presence Registry Active");
 });
 
 const wss = new WebSocketServer({ server });
 
-// Room storage: Map<RoomID, WebSocket[]>
-const rooms = new Map();
+wss.on("connection", (ws, req) => {
+  ws.isAlive = true;
+  ws.sessionId = null;
 
-wss.on('connection', (ws, req) => {
-    // The Flutter app sends the Address/ID via the protocol header
-    const roomId = ws.protocol;
+  log("✨ New Connection Established");
 
-    if (!roomId) {
-        console.log("Connection rejected: No Address protocol provided.");
-        ws.close(1002, "Protocol Required");
-        return;
-    }
+  ws.on("pong", () => ws.isAlive = true);
 
-    // Initialize room
-    if (!rooms.has(roomId)) {
-        rooms.set(roomId, []);
-    }
+  ws.on("message", (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
 
-    const clients = rooms.get(roomId);
+    switch (msg.type) {
+      case 'register':
+        // Handshake to get initial dashboard
+        ws.send(JSON.stringify({ type: 'dashboard_sync', list: registry }));
+        break;
 
-    if (clients.length >= 2) {
-        console.log(`Room ${roomId} is full.`);
-        ws.close(1013, "Room Full");
-        return;
-    }
+      case 'reserve':
+        const newAddress = {
+          id: msg.id || crypto.randomBytes(3).toString('hex').toUpperCase(),
+          nickname: msg.nickname,
+          expiresAt: Date.now() + (msg.duration * 3600000)
+        };
+        registry.push(newAddress);
+        broadcastDashboard();
+        break;
 
-    // Assign a default nickname to prevent nulls in Flutter
-    ws.nickname = "Anonymous";
-    clients.push(ws);
-
-    console.log(`User joined room [${roomId}]. Total users: ${clients.length}`);
-
-    // If room is now full, start the signaling process
-    if (clients.length === 2) {
-        const [peer1, peer2] = clients;
-
-        // Notify Peer 1 (The Initiator)
-        peer1.send(JSON.stringify({
-            type: 'presence_update',
-            isPresent: true,
-            role: 'initiator',
-            nickname: peer2.nickname // Guaranteed non-null
-        }));
-
-        // Notify Peer 2 (The Polite/Receiver)
-        peer2.send(JSON.stringify({
-            type: 'presence_update',
-            isPresent: true,
-            role: 'polite',
-            nickname: peer1.nickname // Guaranteed non-null
-        }));
-    }
-
-    ws.on('message', (rawData) => {
-        try {
-            const msg = JSON.parse(rawData.toString());
-
-            // Update nickname cache if sent
-            if (msg.type === 'identity_broadcast' && msg.nickname) {
-                ws.nickname = String(msg.nickname);
-            }
-
-            // Relay logic
-            const otherPeer = clients.find(client => client !== ws);
-            if (otherPeer && otherPeer.readyState === 1) {
-                // Attach sender's nickname to every relayed message to prevent Dart Null errors
-                msg.nickname = ws.nickname;
-                otherPeer.send(JSON.stringify(msg));
-            }
-        } catch (e) {
-            console.error("Error processing message:", e.message);
+      case 'join':
+        ws.sessionId = msg.address;
+        let s = sessions.get(ws.sessionId);
+        if (!s) {
+          s = { a: ws, b: null };
+          sessions.set(ws.sessionId, s);
+        } else if (!s.b) {
+          s.b = ws;
+          safeSend(s.a, { type: "ready", role: "initiator" });
+          safeSend(s.b, { type: "ready", role: "polite" });
         }
-    });
+        break;
 
-    ws.on('close', () => {
-        const index = clients.indexOf(ws);
-        if (index > -1) {
-            clients.splice(index, 1);
-        }
+      default:
+        const peer = getPeer(ws);
+        if (peer) safeSend(peer, msg);
+        break;
+    }
+  });
 
-        // Notify remaining user that the peer left
-        if (clients.length === 1) {
-            clients[0].send(JSON.stringify({
-                type: 'presence_update',
-                isPresent: false,
-                role: 'none',
-                nickname: 'Disconnected'
-            }));
-        } else {
-            rooms.delete(roomId);
-        }
-        console.log(`User left room [${roomId}]`);
-    });
+  ws.on("close", () => {
+    if (ws.sessionId) hardCollapse(ws, "socket_closed");
+  });
 });
 
-server.listen(port, () => {
-    console.log(`Signaling server running on port ${port}`);
-});
+setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (!ws.isAlive) return ws.terminate();
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, HEARTBEAT_INTERVAL);
+
+server.listen(PORT, "0.0.0.0", () => log(`🚀 Server listening on ${PORT}`));
