@@ -1,16 +1,23 @@
-FROM node:20-alpine
+# Use ultra-lightweight Node Alpine image
+FROM node:18-alpine
 
-WORKDIR /app
+# Set the working directory
+WORKDIR /usr/src/app
 
-# Install dependencies
-COPY package.json ./
+# Copy package files first to leverage Docker layer caching
+COPY package*.json ./
+
+# Install only production dependencies
 RUN npm install --production
 
-# Copy the server code (Ensure this matches your filename!)
-COPY index.js ./ 
+# Copy the server code
+COPY server.js .
 
-ENV NODE_ENV=production
-# The port is provided by Railway at runtime
+# Ensure the app runs as a non-root user for security
+USER node
+
+# Expose the port (Render will override this, but it's good practice)
 EXPOSE 8080
 
-CMD ["node", "index.js"]
+# Command to run the signaling server
+CMD ["npm", "start"]
