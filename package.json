@@ -1,13 +1,11 @@
 {
-  "name": "presence-media-server",
+  "name": "presence-signaling-server",
   "version": "1.0.0",
-  "type": "module",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
+  "main": "index.js",
   "dependencies": {
-    "ws": "^8.16.0",
-    "uuid": "^9.0.1"
+    "ws": "^8.13.0"
+  },
+  "scripts": {
+    "start": "node index.js"
   }
 }
